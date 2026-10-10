@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent } from 'react';
-import logoImg from '../assets/logo.png';
+import AuthFrame from '../components/AuthFrame';
 import { getAuthOptions, loginDashboard, type DashboardUser } from '../lib/api';
 
 export default function Login({ onLoginSuccess }: { onLoginSuccess: (user: DashboardUser) => void }) {
@@ -10,7 +10,7 @@ export default function Login({ onLoginSuccess }: { onLoginSuccess: (user: Dashb
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
-  const inputClass = 'w-full px-4 py-3 bg-slate-900/50 border border-slate-700/50 rounded-lg text-slate-100 placeholder:text-slate-600 focus:outline-none focus:border-cyber-cyan/50 focus:ring-1 focus:ring-cyber-cyan/25';
+  const inputClass = 'cc-input';
   useEffect(() => { getAuthOptions().then(options => setDemoAvailable(options.demo_login_available)).catch(() => {}); }, []);
 
   const submit = async (event: FormEvent) => {
@@ -28,9 +28,8 @@ export default function Login({ onLoginSuccess }: { onLoginSuccess: (user: Dashb
     }
   };
 
-  return <div className="cyber-grid-bg min-h-screen text-slate-200 flex items-center justify-center p-4">
-    <main className="w-full max-w-md border border-cyber-border/60 bg-cyber-panel/95 rounded-xl shadow-2xl p-8">
-      <img src={logoImg} alt="" className="h-12 w-12 mb-6" />
+  return <AuthFrame title="Sign in">
+    <main className="cc-auth-panel">
       <p className="text-xs font-mono tracking-widest text-cyber-cyan uppercase mb-2">CyberAccess console</p>
       <h1 className="text-2xl font-semibold text-white">Sign in to your dashboard</h1>
       <p className="text-sm text-slate-400 mt-2 mb-6">Your organization's traffic, risk decisions and audit history in one place.</p>
@@ -58,5 +57,5 @@ export default function Login({ onLoginSuccess }: { onLoginSuccess: (user: Dashb
           onChange={e => { setDemo(e.target.checked); setPassword(''); setError(''); }} /> Use a demo user instead</label>}
       </div>
     </main>
-  </div>;
+  </AuthFrame>;
 }

@@ -1,5 +1,24 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Clear Workspace tenant console with searchable activity, risk views, analytics, API access and an isolated demo dashboard.
+- API-key-only Lost & Found integration with protected claim reads and actions, per-user quarantine, security notifications and safe server logs.
+- Local integration demonstration showing real allow, deny and block decisions without exposing the tenant key or private claim data.
+- Pinned Lost & Found submodule and setup instructions so clones can retrieve the tested portal integration.
+
+### Changed
+
+- Applied the selected CA monogram across sign-in, signup, console branding, favicons and browser titles.
+- Replaced the portal's legacy defense toggle with tenant integration status and a server-verified block page with a cooldown countdown.
+
+### Verification
+
+- 47 portal tests and 15 frontend tests pass; frontend lint and both production builds pass.
+- Live API/browser checks verify notification recipients, private-data enforcement and block-page layout at desktop and mobile widths.
+
 ## [1.2.0] - 2026-10-10
 
 Changes since the v1.1.1 tag.

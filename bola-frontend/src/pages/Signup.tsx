@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent } from 'react';
-import logoImg from '../assets/logo.png';
+import AuthFrame from '../components/AuthFrame';
 import { claimDashboard, getAuthOptions, signup, type SignupResult } from '../lib/api';
 
 export default function Signup({ claim = false }: { claim?: boolean }) {
@@ -14,7 +14,7 @@ export default function Signup({ claim = false }: { claim?: boolean }) {
   const [result, setResult] = useState<SignupResult | null>(null);
   const [claimed, setClaimed] = useState(false);
   const [copied, setCopied] = useState(false);
-  const inputClass = 'w-full px-4 py-3 bg-slate-900/50 border border-slate-700/50 rounded-lg text-slate-100 placeholder:text-slate-600 focus:outline-none focus:border-cyber-cyan/50 focus:ring-1 focus:ring-cyber-cyan/25';
+  const inputClass = 'cc-input';
   useEffect(() => { getAuthOptions().then(options => setPasswordMinLength(options.password_min_length)).catch(() => {}); }, []);
 
   const submit = async (event: FormEvent) => {
@@ -45,9 +45,8 @@ export default function Signup({ claim = false }: { claim?: boolean }) {
     catch { setError('Copy is unavailable in this browser. Select the key and copy it manually.'); }
   };
 
-  return <div className="cyber-grid-bg min-h-screen text-slate-200 flex items-center justify-center p-4 py-10">
-    <main className="w-full max-w-md border border-cyber-border/60 bg-cyber-panel/95 rounded-xl shadow-2xl p-8">
-      <img src={logoImg} alt="" className="h-12 w-12 mb-6" />
+  return <AuthFrame title={result || claimed ? 'Dashboard ready' : claim ? 'Enable dashboard' : 'Create account'}>
+    <main className="cc-auth-panel">
       <p className="text-xs font-mono tracking-widest text-cyber-cyan uppercase mb-2">CyberAccess console</p>
       {result || claimed ? <>
         <h1 className="text-2xl font-semibold text-white">Your dashboard is ready</h1>
@@ -106,5 +105,5 @@ export default function Signup({ claim = false }: { claim?: boolean }) {
         </div>
       </>}
     </main>
-  </div>;
+  </AuthFrame>;
 }
