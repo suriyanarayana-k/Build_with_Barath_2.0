@@ -3,7 +3,6 @@ module "cyberaccess_tenant" {
 
   base_url   = "https://cyberaccess.your-company.com"
   signup_key = var.cyberaccess_signup_key
-  admin_jwt  = var.cyberaccess_admin_jwt
 
   tenant_name = "acme-corp"
 
@@ -26,11 +25,6 @@ module "cyberaccess_tenant" {
 }
 
 variable "cyberaccess_signup_key" {
-  type      = string
-  sensitive = true
-}
-
-variable "cyberaccess_admin_jwt" {
   type      = string
   sensitive = true
 }

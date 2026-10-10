@@ -1,6 +1,11 @@
 locals {
   creating_tenant = var.tenant_name != ""
   generated_dir   = "${path.module}/.generated"
+  windows_host    = can(regex("^[A-Za-z]:", abspath(path.root)))
+  curl_command    = local.windows_host ? "curl.exe" : "curl"
+  command_interpreter = local.windows_host ? [
+    "PowerShell", "-NoProfile", "-NonInteractive", "-Command"
+  ] : ["/bin/sh", "-c"]
 
   alert_channel_map = {
     for idx, ch in var.alert_channels :
@@ -19,6 +24,13 @@ resource "local_file" "tenant_create_payload" {
   content  = jsonencode({ name = var.tenant_name })
 }
 
+resource "local_sensitive_file" "signup_headers" {
+  count           = local.creating_tenant ? 1 : 0
+  filename        = "${local.generated_dir}/signup_headers.txt"
+  content         = "X-Signup-Key: ${var.signup_key}\n"
+  file_permission = "0600"
+}
+
 resource "null_resource" "create_tenant" {
   count = local.creating_tenant ? 1 : 0
 
@@ -28,7 +40,8 @@ resource "null_resource" "create_tenant" {
   }
 
   provisioner "local-exec" {
-    command = "curl -sf -X POST \"${var.base_url}/v1/tenants\" -H \"Content-Type: application/json\" -H \"X-Signup-Key: ${var.signup_key}\" -d @${local_file.tenant_create_payload[0].filename} -o \"${local.generated_dir}/tenant_create_response.json\""
+    interpreter = local.command_interpreter
+    command     = "${local.curl_command} -fsS --connect-timeout 5 --max-time 30 -X POST \"${var.base_url}/v1/tenants\" -H \"Content-Type: application/json\" -H \"@${local_sensitive_file.signup_headers[0].filename}\" -d \"@${local_file.tenant_create_payload[0].filename}\" -o \"${local.generated_dir}/tenant_create_response.json\""
   }
 
   depends_on = [local_file.tenant_create_payload]
@@ -45,6 +58,14 @@ data "local_file" "tenant_create_response" {
 locals {
   created_tenant = local.creating_tenant ? jsondecode(data.local_file.tenant_create_response[0].content) : null
   tenant_id      = local.creating_tenant ? local.created_tenant.tenant_id : var.existing_tenant_id
+  api_key        = local.creating_tenant ? local.created_tenant.api_key : var.tenant_api_key
+  auth_header    = local.api_key != "" ? "X-API-Key: ${local.api_key}" : "Authorization: Bearer ${var.admin_jwt}"
+}
+
+resource "local_sensitive_file" "tenant_headers" {
+  filename        = "${local.generated_dir}/tenant_headers.txt"
+  content         = "${local.auth_header}\n"
+  file_permission = "0600"
 }
 
 # ---- Quota (POST /tenants/{id}/quota IS a genuine upsert - safe to re-apply
@@ -54,11 +75,11 @@ locals {
 resource "local_file" "quota_payload" {
   filename = "${local.generated_dir}/quota_payload.json"
   content = jsonencode({
-    requests_per_minute       = try(var.quota.requests_per_minute, null)
-    max_stored_audit_events   = try(var.quota.max_stored_audit_events, null)
-    max_audit_retention_days  = try(var.quota.max_audit_retention_days, null)
-    risk_threshold_block      = try(var.quota.risk_threshold_block, null)
-    risk_threshold_warn       = try(var.quota.risk_threshold_warn, null)
+    requests_per_minute      = try(var.quota.requests_per_minute, null)
+    max_stored_audit_events  = try(var.quota.max_stored_audit_events, null)
+    max_audit_retention_days = try(var.quota.max_audit_retention_days, null)
+    risk_threshold_block     = try(var.quota.risk_threshold_block, null)
+    risk_threshold_warn      = try(var.quota.risk_threshold_warn, null)
   })
 }
 
@@ -69,7 +90,8 @@ resource "null_resource" "set_quota" {
   }
 
   provisioner "local-exec" {
-    command = "curl -sf -X POST \"${var.base_url}/tenants/${local.tenant_id}/quota\" -H \"Content-Type: application/json\" -H \"Authorization: Bearer ${var.admin_jwt}\" -d @${local_file.quota_payload.filename}"
+    interpreter = local.command_interpreter
+    command     = "${local.curl_command} -fsS --connect-timeout 5 --max-time 30 -X POST \"${var.base_url}/tenants/${local.tenant_id}/quota\" -H \"Content-Type: application/json\" -H \"@${local_sensitive_file.tenant_headers.filename}\" -d \"@${local_file.quota_payload.filename}\""
   }
 
   depends_on = [local_file.quota_payload, null_resource.create_tenant]
@@ -97,7 +119,8 @@ resource "null_resource" "create_alert_channel" {
   }
 
   provisioner "local-exec" {
-    command = "curl -sf -X POST \"${var.base_url}/tenants/${local.tenant_id}/alert-channels\" -H \"Content-Type: application/json\" -H \"Authorization: Bearer ${var.admin_jwt}\" -d @${local_file.alert_channel_payload[each.key].filename}"
+    interpreter = local.command_interpreter
+    command     = "${local.curl_command} -fsS --connect-timeout 5 --max-time 30 -X POST \"${var.base_url}/tenants/${local.tenant_id}/alert-channels\" -H \"Content-Type: application/json\" -H \"@${local_sensitive_file.tenant_headers.filename}\" -d \"@${local_file.alert_channel_payload[each.key].filename}\""
   }
 
   depends_on = [local_file.alert_channel_payload, null_resource.create_tenant]

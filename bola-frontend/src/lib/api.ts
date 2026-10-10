@@ -1,37 +1,68 @@
-const raw = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
-export const API_BASE = raw.startsWith('http') ? raw.replace(/\/$/, '') : `https://${raw}`.replace(/\/$/, '');
+const raw = import.meta.env.DEV ? '/api' : (import.meta.env.VITE_API_BASE_URL || '/api');
+export const API_BASE = (raw.startsWith('/') || raw.startsWith('http') ? raw : `https://${raw}`).replace(/\/$/, '');
 
-const ADMIN_PWD = import.meta.env.VITE_ADMIN_PASSWORD || 'admin_changeme123';
-
-let adminTokenCache: string | null = null;
-let adminTokenInFlight: Promise<string> | null = null;
-// Several polling functions (getEvents, getAnalyticsOverview, getThreatSummary,
-// getRoiEstimate) all call this on the same ~3s interval. Without de-duping the
-// in-flight request, every one of them fires its own /auth/login call whenever
-// the cache is empty (e.g. backend still starting up), flooding the browser's
-// per-origin connection limit and starving unrelated requests (including the
-// login FORM's own fetch) behind the queue.
-async function adminToken(): Promise<string> {
-  if (adminTokenCache) return adminTokenCache;
-  if (!adminTokenInFlight) {
-    adminTokenInFlight = (async () => {
-      const res = await fetch(`${API_BASE}/auth/login`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ subject: 'security_admin', password: ADMIN_PWD }),
-      });
-      if (!res.ok) throw new Error('admin auth failed');
-      const data = await res.json();
-      adminTokenCache = data.access_token;
-      return adminTokenCache!;
-    })().finally(() => {
-      adminTokenInFlight = null;
-    });
+export async function apiFetch(path: string, options: RequestInit = {}): Promise<Response> {
+  const headers = new Headers(options.headers);
+  headers.set('X-CyberAccess-Console', '1');
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  try {
+    const signal = options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
+    const response = await fetch(`${API_BASE}${path}`, { ...options, credentials: 'include', headers, signal });
+    if (response.status === 401 && (path === '/auth/me' || !path.startsWith('/auth/'))) {
+      window.dispatchEvent(new Event('cyberaccess:session-expired'));
+    }
+    // Keep the timeout active until the body arrives, too.
+    const body = [204, 205, 304].includes(response.status) ? null : await response.text();
+    return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
+  } catch (error) {
+    if (controller.signal.aborted) throw new Error('The backend did not respond within 10 seconds. Please try again.');
+    throw error;
+  } finally {
+    clearTimeout(timeout);
   }
-  return adminTokenInFlight;
 }
 
+async function readJson<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const response = await apiFetch(path, options);
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(typeof data.detail === 'string' ? data.detail : `Request failed (${response.status})`);
+  return data;
+}
+
+export interface DashboardUser {
+  subject: string;
+  role: string;
+  tenant_id: string;
+  tenant_name: string;
+  email: string | null;
+  capabilities: { demo_controls: boolean; manage_api_key: boolean };
+}
+
+export const getSession = async () => (await readJson<{ user: DashboardUser | null }>('/auth/session', { cache: 'no-store' })).user;
+export const getAuthOptions = () => readJson<{ password_min_length: number; demo_login_available: boolean }>('/auth/options');
+export const loginDashboard = (email: string, password: string, demo = false) => readJson<{ user: DashboardUser }>('/auth/login', {
+  method: 'POST', headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify(demo ? { subject: email, password, console: true } : { email, password }),
+});
+export const logoutDashboard = () => readJson<{ status: string }>('/auth/logout', { method: 'POST' });
+export const claimDashboard = (apiKey: string, email: string, password: string) => readJson<{ user: DashboardUser }>('/auth/claim-tenant', {
+  method: 'POST', headers: { 'Content-Type': 'application/json', 'X-API-Key': apiKey },
+  body: JSON.stringify({ email, password }),
+});
+export const replaceApiKey = (password: string) => readJson<SignupResult>('/auth/api-key/rotate', {
+  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password }), cache: 'no-store',
+});
+
+export interface QuotaUsage {
+  tenant_id: string;
+  current_usage: { requests_this_minute: number; requests_per_minute_limit: number; requests_percent: number; audit_events_stored: number };
+}
+export const getQuotaUsage = (tenantId: string) => readJson<QuotaUsage>(`/tenants/${encodeURIComponent(tenantId)}/quota-usage`);
+
 export interface ConfigResp {
+  risk_threshold_block: number;
+  risk_threshold_warn: number;
   short_window: number;
   long_window: number;
   rapid_threshold: number;
@@ -68,6 +99,7 @@ export interface AuditEvent {
   outcome: string;
   explanation: string;
   event_type?: string;
+  risk_score?: number;
 }
 
 export interface LockoutStatus {
@@ -124,44 +156,34 @@ export interface RoiEstimate {
 }
 
 export async function getConfig(): Promise<ConfigResp> {
-  const res = await fetch(`${API_BASE}/config`);
+  const res = await apiFetch('/config');
   if (!res.ok) throw new Error(`config: ${res.status}`);
   return res.json();
 }
 
 export async function getStats(): Promise<StatsResp> {
-  const res = await fetch(`${API_BASE}/stats`);
+  const res = await apiFetch('/stats');
   if (!res.ok) throw new Error(`stats: ${res.status}`);
   return res.json();
 }
 
 export async function getRisk(subject: string): Promise<RiskResp> {
-  const res = await fetch(`${API_BASE}/risk/${encodeURIComponent(subject)}`);
+  const res = await apiFetch(`/risk/${encodeURIComponent(subject)}`);
   if (!res.ok) throw new Error(`risk: ${res.status}`);
   return res.json();
 }
 
 export async function getLockoutStatus(subject: string): Promise<LockoutStatus> {
-  const res = await fetch(`${API_BASE}/lockout-status/${encodeURIComponent(subject)}`);
+  const res = await apiFetch(`/lockout-status/${encodeURIComponent(subject)}`);
   if (!res.ok) throw new Error(`lockout: ${res.status}`);
   return res.json();
 }
 
 export async function getEvents(): Promise<AuditEvent[]> {
-  const token = await adminToken();
-  const res = await fetch(`${API_BASE}/audit-timeline?limit=50`, { headers: { Authorization: `Bearer ${token}` } });
+  const res = await apiFetch('/events');
   if (!res.ok) throw new Error(`events: ${res.status}`);
   const data = await res.json();
-  return (data.timeline || []).map((e: any) => ({
-    id: e.id,
-    occurred_at: e.timestamp,
-    subject_id: e.subject,
-    record_id: e.resource,
-    detector_decision: e.decision,
-    outcome: e.outcome,
-    explanation: e.details,
-    event_type: e.event_type,
-  }));
+  return data.events || [];
 }
 
 export interface SignupResult {
@@ -169,13 +191,15 @@ export interface SignupResult {
   name: string;
   api_key: string;
   warning: string;
+  user?: DashboardUser;
 }
 
-export async function signup(name: string, email?: string): Promise<SignupResult> {
-  const res = await fetch(`${API_BASE}/v1/signup`, {
+export async function signup(name: string, email?: string, password?: string): Promise<SignupResult> {
+  const res = await apiFetch(password === undefined ? '/v1/signup' : '/auth/signup', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(email ? { name, email } : { name }),
+    body: JSON.stringify({ name, email, password }),
+    cache: 'no-store',
   });
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
@@ -184,29 +208,20 @@ export async function signup(name: string, email?: string): Promise<SignupResult
   return res.json();
 }
 
-export async function getAnalyticsOverview(tenantId = 'demo', windowHours = 24): Promise<AnalyticsOverview> {
-  const token = await adminToken();
-  const res = await fetch(`${API_BASE}/tenants/${encodeURIComponent(tenantId)}/analytics/overview?window_hours=${windowHours}`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
+export async function getAnalyticsOverview(tenantId: string, windowHours = 24): Promise<AnalyticsOverview> {
+  const res = await apiFetch(`/tenants/${encodeURIComponent(tenantId)}/analytics/overview?window_hours=${windowHours}`);
   if (!res.ok) throw new Error(`analytics overview: ${res.status}`);
   return res.json();
 }
 
-export async function getThreatSummary(tenantId = 'demo', windowHours = 24): Promise<ThreatSummary> {
-  const token = await adminToken();
-  const res = await fetch(`${API_BASE}/tenants/${encodeURIComponent(tenantId)}/analytics/threat-summary?window_hours=${windowHours}`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
+export async function getThreatSummary(tenantId: string, windowHours = 24): Promise<ThreatSummary> {
+  const res = await apiFetch(`/tenants/${encodeURIComponent(tenantId)}/analytics/threat-summary?window_hours=${windowHours}`);
   if (!res.ok) throw new Error(`threat summary: ${res.status}`);
   return res.json();
 }
 
-export async function getRoiEstimate(tenantId = 'demo', windowDays = 30): Promise<RoiEstimate> {
-  const token = await adminToken();
-  const res = await fetch(`${API_BASE}/tenants/${encodeURIComponent(tenantId)}/analytics/roi?window_days=${windowDays}`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
+export async function getRoiEstimate(tenantId: string, windowDays = 30): Promise<RoiEstimate> {
+  const res = await apiFetch(`/tenants/${encodeURIComponent(tenantId)}/analytics/roi?window_days=${windowDays}`);
   if (!res.ok) throw new Error(`roi estimate: ${res.status}`);
   return res.json();
 }
@@ -224,7 +239,7 @@ export interface SimResult {
 }
 
 // idor_sweep/horizontal_privilege/stealth_creep are safe, repeatable presets -
-// none touch canary IDs (0, 999999, canary_admin_vault), so none risk a real
+// These three presets do not touch canary IDs (0, 999999, canary_admin_vault), so none risk a real
 // permanent ban on a named demo persona. NORMAL isn't a backend preset - it
 // passes bob's own record IDs explicitly so the campaign runner scores a
 // legitimate, fully-authorized access pattern instead of an attack. Uses bob,
@@ -236,11 +251,12 @@ const SCENARIOS: Record<string, { scenario_name?: string; attacker_subject?: str
   'RAPID BOLA': { scenario_name: 'horizontal_privilege' },
   'LOW & SLOW': { scenario_name: 'stealth_creep' },
   'COORDINATED': { scenario_name: 'idor_sweep' },
+  'CANARY PROBE': { scenario_name: 'canary_trap' },
 };
 
 export async function runSimulation(kind: keyof typeof SCENARIOS): Promise<SimResult> {
   const payload = SCENARIOS[kind];
-  const res = await fetch(`${API_BASE}/redteam/campaign`, {
+  const res = await apiFetch('/redteam/campaign', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),

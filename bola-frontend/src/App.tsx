@@ -1,15 +1,16 @@
-import { useEffect, useRef, useState, useMemo } from 'react';
+import { useCallback, useEffect, useRef, useState, useMemo } from 'react';
 import logoImg from './assets/logo.png';
 import {
   getConfig, getStats, getRisk, getEvents, runSimulation, SCENARIOS,
   getAnalyticsOverview, getThreatSummary, getRoiEstimate,
   type ConfigResp, type StatsResp, type RiskResp, type AuditEvent,
   type AnalyticsOverview, type ThreatSummary, type RoiEstimate,
-  API_BASE,
+  apiFetch, getSession, logoutDashboard, type DashboardUser,
 } from './lib/api';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import Login from './pages/Login';
 import Signup from './pages/Signup';
+import TenantAccessCard from './components/TenantAccessCard';
 
 function timeAgo(unixSeconds: number): string {
   if (!unixSeconds) return 'LIVE';
@@ -20,7 +21,9 @@ function timeAgo(unixSeconds: number): string {
 }
 
 export default function App() {
-  const [authToken, setAuthToken] = useState<string | null>(() => localStorage.getItem('authToken'));
+  const [user, setUser] = useState<DashboardUser | null>(null);
+  const [sessionLoading, setSessionLoading] = useState(true);
+  const sessionVersion = useRef(0);
   const [online, setOnline] = useState<boolean | null>(null);
   const [config, setConfig] = useState<ConfigResp | null>(null);
   const [stats, setStats] = useState<StatsResp | null>(null);
@@ -35,62 +38,112 @@ export default function App() {
   const [threatSummary, setThreatSummary] = useState<ThreatSummary | null>(null);
   const [roi, setRoi] = useState<RoiEstimate | null>(null);
   const [utcTime, setUtcTime] = useState('');
+  const [nowSeconds, setNowSeconds] = useState(() => Math.floor(Date.now() / 1000));
   const [activeBtn, setActiveBtn] = useState<string | null>(null);
   const [apiError, setApiError] = useState<string | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const handleLoginSuccess = (token: string) => {
-    localStorage.setItem('authToken', token);
-    setAuthToken(token);
+  const clearTelemetry = useCallback(() => {
+    sessionVersion.current += 1;
+    setEvents([]); setAnalytics(null); setThreatSummary(null); setRoi(null);
+    setStats(null); setConfig(null); setRisk(null); setRiskSubject(''); setSubjectInput('');
+    setOnline(null); setApiError(null); setSimVerdict(null); setSimRunning(null);
+    setRiskLoading(false); setActiveBtn(null);
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+  }, []);
+
+  const handleLoginSuccess = (identity: DashboardUser) => {
+    clearTelemetry();
+    setUser(identity);
+    window.history.replaceState(null, '', '/dashboard');
   };
 
-  const handleLogout = () => {
-    localStorage.removeItem('authToken');
-    setAuthToken(null);
+  const handleLogout = async () => {
+    try {
+      await logoutDashboard();
+      clearTelemetry();
+      setUser(null);
+    } catch (err) {
+      setApiError(err instanceof Error ? err.message : 'Could not sign out. Please retry.');
+    }
   };
+
+  useEffect(() => {
+    // Migrate old browser logins without retaining a script-readable token.
+    localStorage.removeItem('authToken');
+    let stopped = false;
+    getSession().then(identity => { if (!stopped) setUser(identity); })
+      .catch(() => { if (!stopped) setUser(null); })
+      .finally(() => { if (!stopped) setSessionLoading(false); });
+    return () => { stopped = true; };
+  }, []);
 
   // UTC Clock
   useEffect(() => {
     const updateTime = () => {
       const now = new Date();
-      setUtcTime(now.toTimeString().slice(0, 8));
+      setUtcTime(now.toISOString().slice(11, 19));
+      setNowSeconds(Math.floor(now.getTime() / 1000));
     };
     updateTime();
     const interval = setInterval(updateTime, 1000);
     return () => clearInterval(interval);
   }, []);
 
-  const refreshPassive = async () => {
+  const refreshPassive = useCallback(async () => {
+    if (!user) return;
+    const version = sessionVersion.current;
     try {
       const [c, s] = await Promise.all([getConfig(), getStats()]);
+      if (version !== sessionVersion.current) return;
       setConfig(c);
       setStats(s);
       setOnline(true);
     } catch {
-      setOnline(false);
+      if (version === sessionVersion.current) setOnline(false);
     }
     try {
-      setEvents(await getEvents());
+      const nextEvents = await getEvents();
+      if (version !== sessionVersion.current) return;
+      setEvents(nextEvents);
     } catch {
-      // audit timeline needs security_admin auth; leave prior state on failure
+      if (version === sessionVersion.current) setApiError('Could not refresh your audit history.');
     }
     try {
-      const [a, t, r] = await Promise.all([getAnalyticsOverview(), getThreatSummary(), getRoiEstimate()]);
+      const [a, t, r] = await Promise.all([getAnalyticsOverview(user.tenant_id), getThreatSummary(user.tenant_id), getRoiEstimate(user.tenant_id)]);
+      if (version !== sessionVersion.current) return;
       setAnalytics(a);
       setThreatSummary(t);
       setRoi(r);
     } catch {
-      // Phase 4/5 endpoints need security_admin auth too; leave prior state on failure
+      if (version === sessionVersion.current) setApiError('Could not refresh your tenant analytics.');
     }
-  };
+  }, [user]);
 
   useEffect(() => {
-    refreshPassive();
-    const timer = setInterval(refreshPassive, 3000);
-    return () => clearInterval(timer);
+    if (!user || ['/signup', '/claim'].includes(window.location.pathname)) return;
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const poll = async () => {
+      await refreshPassive();
+      if (!stopped) timer = setTimeout(poll, 3000);
+    };
+    void poll();
+    return () => { stopped = true; clearTimeout(timer); };
+  }, [user, refreshPassive]);
+
+  useEffect(() => {
+    const expire = () => { clearTelemetry(); setUser(null); };
+    window.addEventListener('cyberaccess:session-expired', expire);
+    return () => window.removeEventListener('cyberaccess:session-expired', expire);
+  }, [clearTelemetry]);
+
+  useEffect(() => () => {
+    if (debounceRef.current) clearTimeout(debounceRef.current);
   }, []);
 
   const fetchRisk = async (subject: string) => {
+    const version = sessionVersion.current;
     if (!subject.trim()) {
       setRisk(null);
       setApiError(null);
@@ -99,13 +152,16 @@ export default function App() {
     setRiskLoading(true);
     setApiError(null);
     try {
-      setRisk(await getRisk(subject.trim()));
+      const nextRisk = await getRisk(subject.trim());
+      if (version !== sessionVersion.current) return;
+      setRisk(nextRisk);
       setOnline(true);
     } catch (err) {
+      if (version !== sessionVersion.current) return;
       setRisk(null);
       setApiError(err instanceof Error ? err.message : 'Failed to fetch risk data');
     } finally {
-      setRiskLoading(false);
+      if (version === sessionVersion.current) setRiskLoading(false);
     }
   };
 
@@ -130,42 +186,9 @@ export default function App() {
     }
   };
 
-  const runUrlBlockingAttack = async (attackType: string) => {
-    setActiveBtn(attackType);
-    setTimeout(() => setActiveBtn(null), 300);
-    setSimRunning(attackType);
-    setSimVerdict(null);
-    try {
-      const response = await fetch(`${API_BASE}/trigger-attack`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ attack_type: attackType }),
-      });
-
-      if (response.ok) {
-        const result = await response.json();
-        const msg = result.message || 'Attack executed';
-        setSimVerdict(`${msg} · Audit logs created`);
-
-        // Refresh to show new audit events
-        await new Promise(r => setTimeout(r, 500));
-        await refreshPassive();
-      } else {
-        setSimVerdict('Attack failed - backend error');
-      }
-    } catch (err) {
-      setSimVerdict(`attack error: ${err instanceof Error ? err.message : String(err)}`);
-    } finally {
-      setSimRunning(null);
-    }
-  };
-
   const runSim = async (kind: string) => {
-    // Handle URL blocking attacks
-    if (kind.startsWith('URL_BLOCKING')) {
-      return runUrlBlockingAttack(kind);
-    }
-
+    if (!user?.capabilities.demo_controls) return;
+    const version = sessionVersion.current;
     // Handle regular BOLA simulations
     const simKind = kind as keyof typeof SCENARIOS;
     setActiveBtn(kind);
@@ -174,6 +197,7 @@ export default function App() {
     setSimVerdict(null);
     try {
       const res = await runSimulation(simKind);
+      if (version !== sessionVersion.current) return;
       setSimVerdict(`${res.verdict} · ${res.interception_rate_percent}% intercepted (${res.blocked_count} blocked, ${res.denied_count} denied of ${res.total_requests})`);
       if (res.attacker_subject) {
         setRiskSubject(res.attacker_subject);
@@ -182,21 +206,25 @@ export default function App() {
       }
       await refreshPassive();
     } catch (err) {
+      if (version !== sessionVersion.current) return;
       setSimVerdict(`simulation error: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
-      setSimRunning(null);
+      if (version === sessionVersion.current) setSimRunning(null);
     }
   };
 
   const resetDemo = async () => {
+    if (!user?.capabilities.demo_controls) return;
+    const version = sessionVersion.current;
     setActiveBtn('reset');
     setTimeout(() => setActiveBtn(null), 300);
     setSimRunning('RESET');
     try {
       // Call FastAPI reset endpoint - it clears audit_events from database
-      const res = await fetch(`${API_BASE}/reset`, { method: 'POST' });
+      const res = await apiFetch('/reset', { method: 'POST' });
       console.log('Reset response:', res.status, res.ok);
       const data = await res.json();
+      if (version !== sessionVersion.current) return;
       console.log('Reset result:', data);
 
       if (!res.ok) {
@@ -237,10 +265,12 @@ export default function App() {
 
   // Risk display calculation
   const riskScore = risk?.score ?? 0;
-  const riskCategory = (risk?.category || (riskScore > 70 ? 'CRITICAL' : riskScore > 35 ? 'SUSPICIOUS' : 'NORMAL')).toUpperCase();
+  const blockThreshold = config?.risk_threshold_block ?? 90;
+  const warnThreshold = config?.risk_threshold_warn ?? 70;
+  const riskCategory = (risk?.category || (riskScore >= blockThreshold ? 'CRITICAL' : riskScore >= warnThreshold ? 'SUSPICIOUS' : 'NORMAL')).toUpperCase();
 
   const statusColorConfig = useMemo(() => {
-    if (riskScore >= 70 || riskCategory.includes('CRIT') || riskCategory.includes('BLOCK')) {
+    if (riskScore >= blockThreshold || riskCategory.includes('CRIT') || riskCategory.includes('BLOCK') || riskCategory.includes('ATTACK')) {
       return {
         text: 'text-cyber-crimson',
         bg: 'bg-cyber-crimsonMuted/40',
@@ -252,7 +282,7 @@ export default function App() {
         help: 'Critical threat level - immediate attention required'
       };
     }
-    if (riskScore >= 35 || riskCategory.includes('SUSP') || riskCategory.includes('SLOW')) {
+    if (riskScore >= warnThreshold || riskCategory.includes('SUSP') || riskCategory.includes('SLOW')) {
       return {
         text: 'text-cyber-orange',
         bg: 'bg-cyber-orangeMuted/40',
@@ -269,32 +299,33 @@ export default function App() {
       bg: 'bg-emerald-500/10',
       border: 'border-emerald-500/30',
       pulse: 'bg-emerald-400',
-      desc: 'Zero threats flagged',
+      desc: risk ? 'Zero threats flagged' : 'Select a subject to inspect risk',
       glow: 'drop-shadow-[0_0_18px_rgba(255,42,68,0.5)]',
       barColor: 'bg-emerald-400',
       help: 'Normal risk level'
     };
-  }, [riskScore, riskCategory]);
+  }, [riskScore, riskCategory, blockThreshold, warnThreshold, risk]);
 
-  // Calculated vectors from contributions or defaults
+  // Only observed detector contributions; never invent threat values from the total score.
   const vectorScores = useMemo(() => {
     const contrib = risk?.contributions || {};
-    const authVel = Math.min(100, Math.round(Number(contrib.rapid_requests || contrib.auth_velocity || (riskScore > 50 ? riskScore : 0))));
-    const anomaly = Math.min(100, Math.round(Number(contrib.unusual_timing || contrib.timing_anomaly || (riskScore > 30 ? 45 : 0))));
-    const ipRep = Math.min(100, Math.round(Number(contrib.ip_reputation || (riskScore > 75 ? 80 : 0))));
-    const pattern = Math.min(100, Math.round(Number(contrib.pattern_match || contrib.cluster_overlap || (attackCount > 0 ? 85 : 0))));
+    const authVel = Math.min(100, Math.round(Number(contrib.unauthorized_unique_object_pressure ?? contrib.unique_denied_short ?? 0)));
+    const anomaly = Math.min(100, Math.round(Number(contrib.ml_behavioral_anomaly ?? 0)));
+    const ipRep = Math.min(100, Math.round(Number(contrib.ip_reputation ?? 0)));
+    const pattern = Math.min(100, Math.round(Number(contrib.sequential_id_enumeration ?? contrib.low_and_slow_reconnaissance ?? 0)));
 
     return { authVel, anomaly, ipRep, pattern };
-  }, [risk, riskScore, attackCount]);
+  }, [risk]);
 
   // Simple pathname-based routing (no router dependency, matching this app's minimal style):
   // /signup is a standalone public page, reachable whether or not the viewer is logged in.
-  if (window.location.pathname === '/signup') {
-    return <Signup />;
+  if (['/signup', '/claim'].includes(window.location.pathname)) {
+    return <Signup claim={window.location.pathname === '/claim'} />;
   }
 
+  if (sessionLoading) return <div className="cyber-grid-bg min-h-screen flex items-center justify-center text-slate-300" role="status">Opening your dashboard...</div>;
   // Show login page if not authenticated
-  if (!authToken) {
+  if (!user) {
     return <Login onLoginSuccess={handleLoginSuccess} />;
   }
 
@@ -302,7 +333,7 @@ export default function App() {
     <div className="cyber-grid-bg min-h-screen text-slate-200 font-sans flex flex-col selection:bg-rose-900 selection:text-white antialiased">
       {/* BEGIN: MainHeader */}
       <header className="w-full border-b border-cyber-border/80 bg-cyber-panel/85 backdrop-blur-md sticky top-0 z-50">
-        <div className="px-6 py-3 flex items-center justify-between gap-4 w-full">
+        <div className="px-6 py-3 flex flex-wrap items-center justify-between gap-4 w-full">
           {/* Brand & Title Lockup with 3D Floating Shield */}
           <div className="flex items-center gap-3.5 group cursor-pointer select-none">
             <div className="relative flex items-center justify-center">
@@ -329,7 +360,8 @@ export default function App() {
           </div>
 
           {/* Telemetry & Network Heartbeat Bar */}
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-3">
+            <span className="text-xs text-slate-300 max-w-48 truncate" title={user.tenant_name}>{user.tenant_name}</span>
             {/* Heartbeat / Time indicator */}
             <div className="hidden md:flex items-center gap-2 px-3 py-1.5 rounded-md border border-cyber-border bg-[#0a0d14]/70 font-mono text-[11px] text-cyber-textMuted">
               <span className={`w-2 h-2 rounded-full ${online ? 'bg-cyan-400 animate-pulse' : 'bg-slate-600'}`}></span>
@@ -571,7 +603,7 @@ export default function App() {
                   </svg>
                   <input
                     className="w-full bg-[#07090e] border border-cyber-border text-xs rounded-md pl-8 pr-3 py-1.5 text-slate-200 placeholder-neutral-500 focus:outline-none focus:border-rose-500 focus:ring-1 focus:ring-rose-500 font-mono transition-all"
-                    placeholder="alice, 192.168.1.1, or scan ID..."
+                      placeholder={user.capabilities.demo_controls ? 'Demo subject ID...' : "Your application's user ID..."}
                     type="text"
                     value={subjectInput}
                     onChange={(e) => onSubjectInput(e.target.value)}
@@ -622,7 +654,7 @@ export default function App() {
                     </span>
                     {risk?.is_blocked && (
                       <span className="font-mono text-[9px] text-rose-400 font-bold mt-1.5 px-2 py-0.5 rounded bg-rose-950/40 border border-rose-800/50 animate-pulse">
-                        ⏱️ QUARANTINE: {risk.lockout_expires_at ? Math.max(0, risk.lockout_expires_at - Math.floor(Date.now() / 1000)) : (risk.lockout_remaining_s || 120)}s
+                        ⏱️ QUARANTINE: {risk.lockout_expires_at ? Math.max(0, risk.lockout_expires_at - nowSeconds) : (risk.lockout_remaining_s || 0)}s
                       </span>
                     )}
                   </div>
@@ -708,7 +740,8 @@ export default function App() {
           </ErrorBoundary>
 
           {/* BEGIN: LiveSimulatorCard (Tactical Suite) */}
-          <ErrorBoundary label="Live Simulator">
+          {!user.capabilities.demo_controls && <TenantAccessCard key={user.tenant_id} user={user} eventCount={analytics?.total_events ?? events.length} />}
+          {user.capabilities.demo_controls && <ErrorBoundary label="Live Simulator">
             <section className="rounded-xl bg-cyber-panel border border-cyber-border p-5 relative shadow-tactical flex flex-col flex-1">
               <div className="flex items-center justify-between mb-4 pb-2 border-b border-cyber-border/60">
                 <div className="flex items-center gap-2">
@@ -782,9 +815,9 @@ export default function App() {
 
                 <button
                   disabled={simRunning !== null}
-                  onClick={() => runSim('URL_BLOCKING_4')}
+                  onClick={() => runSim('CANARY PROBE')}
                   className={`btn-tactical group relative rounded-lg border border-pink-800/80 bg-gradient-to-b from-pink-950/40 to-[#140810] p-3 text-center shadow-glowRed/20 hover:border-pink-500 hover:shadow-glowRed active:bg-pink-900/40 disabled:opacity-50 ${
-                    activeBtn === 'URL_BLOCKING_4' ? 'ring-2 ring-pink-500/60' : ''
+                    activeBtn === 'CANARY PROBE' ? 'ring-2 ring-pink-500/60' : ''
                   }`}
                   type="button"
                 >
@@ -825,7 +858,7 @@ export default function App() {
                 </button>
               </div>
             </section>
-          </ErrorBoundary>
+          </ErrorBoundary>}
         </div>
         {/* END: Column 2 */}
 
@@ -917,7 +950,7 @@ export default function App() {
                       No events recorded.
                     </span>
                     <p className="font-mono text-[11px] text-cyber-textMuted leading-relaxed">
-                      Waiting for activity. Run a test above to see events appear here.
+                      {user.capabilities.demo_controls ? 'Waiting for activity. Run a test to see events here.' : 'Waiting for your application. Connect your backend to see your authorization activity here.'}
                     </p>
                   </div>
 

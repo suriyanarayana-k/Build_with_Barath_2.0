@@ -1,4 +1,4 @@
-﻿services:
+services:
   postgres:
     image: postgres:16-alpine
     container_name: cyberaccess-postgres
@@ -12,7 +12,7 @@
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d cyberaccess"]
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -58,7 +58,8 @@
       GF_SECURITY_ADMIN_USER: ${GF_SECURITY_ADMIN_USER:-admin}
     volumes:
       - grafana_data:/var/lib/grafana
-      - ./grafana-dashboards:/etc/grafana/provisioning/dashboards
+      - ./grafana-dashboards:/var/lib/grafana/dashboards:ro
+      - ./grafana-dashboard-provider.yml:/etc/grafana/provisioning/dashboards/cyberaccess.yml:ro
       - ./grafana-datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml
     depends_on:
       - prometheus
@@ -70,16 +71,60 @@
     container_name: cyberaccess-backend
     restart: unless-stopped
     environment:
-      DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:postgrespassword@postgres:5432/cyberaccess}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgrespassword}@postgres:5432/${POSTGRES_DB:-cyberaccess}}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       APP_ENV: ${APP_ENV:-dev}
       DEMO_MODE: ${DEMO_MODE:-true}
-      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-*}
+      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-}
       DEFAULT_REQUESTS_PER_MINUTE: ${DEFAULT_REQUESTS_PER_MINUTE:-1000}
       REDIS_CACHE_TTL_QUOTAS: ${REDIS_CACHE_TTL_QUOTAS:-60}
+      DEFAULT_MAX_AUDIT_EVENTS: ${DEFAULT_MAX_AUDIT_EVENTS:-1000000}
+      DEFAULT_AUDIT_RETENTION_DAYS: ${DEFAULT_AUDIT_RETENTION_DAYS:-365}
+      DEFAULT_RISK_THRESHOLD_BLOCK: ${DEFAULT_RISK_THRESHOLD_BLOCK:-90}
+      DEFAULT_RISK_THRESHOLD_WARN: ${DEFAULT_RISK_THRESHOLD_WARN:-70}
+      RATE_LIMIT_WINDOW_SECONDS: ${RATE_LIMIT_WINDOW_SECONDS:-60}
       QUOTA_ALERT_THRESHOLD_PERCENT: ${QUOTA_ALERT_THRESHOLD_PERCENT:-80}
       QUOTA_ALERT_BATCH_SIZE: ${QUOTA_ALERT_BATCH_SIZE:-50}
       SMTP_ENABLED: ${SMTP_ENABLED:-false}
+      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-noreply@cyberaccess.io}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      ALERT_SLACK_TIMEOUT: ${ALERT_SLACK_TIMEOUT:-5}
+      ALERT_EMAIL_TIMEOUT: ${ALERT_EMAIL_TIMEOUT:-10}
+      ALERT_WEBHOOK_TIMEOUT: ${ALERT_WEBHOOK_TIMEOUT:-5}
+      JWT_SECRET: ${JWT_SECRET:-dev-insecure-secret-change-in-production}
+      DEMO_PASSWORD: ${DEMO_PASSWORD:-changeme123}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin_changeme123}
+      TENANT_SIGNUP_KEY: ${TENANT_SIGNUP_KEY:-dev-insecure-signup-key-change-in-production}
+      JWT_EXPIRY_SECONDS: ${JWT_EXPIRY_SECONDS:-3600}
+      CONSOLE_COOKIE_SECURE: ${CONSOLE_COOKIE_SECURE:-}
+      CONSOLE_PASSWORD_MIN_LENGTH: ${CONSOLE_PASSWORD_MIN_LENGTH:-12}
+      CONSOLE_AUTH_RATE_LIMIT: ${CONSOLE_AUTH_RATE_LIMIT:-10/minute}
+      BCRYPT_ROUNDS: ${BCRYPT_ROUNDS:-12}
+      DB_POOL_MAX_SIZE: ${DB_POOL_MAX_SIZE:-10}
+      DB_POOL_TIMEOUT_SECONDS: ${DB_POOL_TIMEOUT_SECONDS:-5}
+      THREAT_DETECTION_ENABLED: ${THREAT_DETECTION_ENABLED:-true}
+      IP_REPUTATION_LOOKBACK_SECONDS: ${IP_REPUTATION_LOOKBACK_SECONDS:-3600}
+      IP_REPUTATION_VIOLATION_THRESHOLD: ${IP_REPUTATION_VIOLATION_THRESHOLD:-5}
+      ABUSEIPDB_API_KEY: ${ABUSEIPDB_API_KEY:-}
+      ABUSEIPDB_SCORE_THRESHOLD: ${ABUSEIPDB_SCORE_THRESHOLD:-50}
+      GEO_LOOKUP_ENABLED: ${GEO_LOOKUP_ENABLED:-false}
+      GEO_VELOCITY_MAX_KMH: ${GEO_VELOCITY_MAX_KMH:-900}
+      BEHAVIORAL_BASELINE_MIN_SAMPLES: ${BEHAVIORAL_BASELINE_MIN_SAMPLES:-20}
+      BEHAVIORAL_DEVIATION_MULTIPLIER: ${BEHAVIORAL_DEVIATION_MULTIPLIER:-3.0}
+      TLS_FINGERPRINT_BLOCKLIST: ${TLS_FINGERPRINT_BLOCKLIST:-}
+      ROI_ASSUMED_COST_PER_BREACH_USD: ${ROI_ASSUMED_COST_PER_BREACH_USD:-50000}
+      ROI_ASSUMED_BREACH_PROBABILITY_PER_ATTACK: ${ROI_ASSUMED_BREACH_PROBABILITY_PER_ATTACK:-0.02}
+      ROI_ASSUMED_MANUAL_REVIEW_MINUTES_PER_EVENT: ${ROI_ASSUMED_MANUAL_REVIEW_MINUTES_PER_EVENT:-15}
+      ROI_ASSUMED_ENGINEER_HOURLY_COST_USD: ${ROI_ASSUMED_ENGINEER_HOURLY_COST_USD:-75}
+      DATADOG_ENABLED: ${DATADOG_ENABLED:-false}
+      DATADOG_API_KEY: ${DATADOG_API_KEY:-}
+      DATADOG_SITE: ${DATADOG_SITE:-datadoghq.com}
+      SPLUNK_HEC_ENABLED: ${SPLUNK_HEC_ENABLED:-false}
+      SPLUNK_HEC_URL: ${SPLUNK_HEC_URL:-}
+      SPLUNK_HEC_TOKEN: ${SPLUNK_HEC_TOKEN:-}
+      SPLUNK_HEC_SOURCETYPE: ${SPLUNK_HEC_SOURCETYPE:-cyberaccess:soc_alert}
     ports:
       - "${BACKEND_PORT:-8000}:8000"
     depends_on:
@@ -93,7 +138,7 @@
       context: ./bola-frontend
       dockerfile: Dockerfile
       args:
-        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://backend:8000}
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/api}
     container_name: cyberaccess-frontend
     restart: unless-stopped
     ports:
@@ -110,7 +155,7 @@
     environment:
       CYBERACCESS_ENABLED: ${CYBERACCESS_ENABLED:-true}
       CYBERACCESS_API_URL: ${CYBERACCESS_API_URL:-http://backend:8000}
-      CYBERACCESS_API_KEY: ${CYBERACCESS_API_KEY:-demo-key-12345}
+      CYBERACCESS_API_KEY: ${CYBERACCESS_API_KEY:-}
       CYBERACCESS_FAIL_OPEN: ${CYBERACCESS_FAIL_OPEN:-true}
       CYBERACCESS_TIMEOUT: ${CYBERACCESS_TIMEOUT:-2.0}
       DJANGO_SETTINGS_MODULE: ${DJANGO_SETTINGS_MODULE:-lost_found_project.settings}

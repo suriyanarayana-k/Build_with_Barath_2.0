@@ -1,4 +1,4 @@
-﻿services:
+services:
   # 1. FastAPI Behavioral Risk Engine & Multi-Tenant Product API
   - type: web
     name: bola-backend-api
@@ -8,7 +8,7 @@
     startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11.8
+        value: 3.12.12
       # No Render-managed Postgres here - Render's free plan caps free
       # Postgres at one per account. Using an external Neon (or Supabase)
       # connection string avoids that cap entirely and doesn't expire after

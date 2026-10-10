@@ -1,0 +1,29 @@
+name: frontend tests
+
+on:
+  push:
+    branches: [master]
+    paths: ['bola-frontend/**', 'src/**', 'package*.json', '*config*', '.github/workflows/frontend-tests.yml']
+  pull_request:
+    branches: [master]
+    paths: ['bola-frontend/**', 'src/**', 'package*.json', '*config*', '.github/workflows/frontend-tests.yml']
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        directory: ['.', 'bola-frontend']
+    defaults:
+      run:
+        working-directory: ${{ matrix.directory }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
+      - if: matrix.directory == 'bola-frontend'
+        run: npm test

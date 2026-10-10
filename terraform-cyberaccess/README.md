@@ -29,7 +29,9 @@ A newly created tenant's `api_key` is shown by the API exactly once. To make it
 available as a Terraform output across future `plan`/`apply` runs (not just the
 one that created it), this module persists the raw API response - including that
 key - in plaintext at `.generated/tenant_create_response.json` inside the module
-directory. That path is already in `.gitignore`, but you are responsible for:
+directory. Sensitive header files in that directory let curl authenticate without
+putting keys in command arguments and work on both Windows and Unix shells.
+That path is already in `.gitignore`, but you are responsible for:
 
 - treating `.generated/` as sensitive on disk (it's equivalent to a secrets file),
 - copying `tenant_api_key` into your real secrets manager promptly, and
@@ -44,7 +46,6 @@ module "acme_tenant" {
 
   base_url   = "https://cyberaccess.your-company.com"
   signup_key = var.cyberaccess_signup_key   # TENANT_SIGNUP_KEY on the backend
-  admin_jwt  = var.cyberaccess_admin_jwt    # a security_admin JWT, generated out-of-band
 
   tenant_name = "acme-corp"
 
@@ -61,13 +62,14 @@ module "acme_tenant" {
 
 To manage an **existing** tenant instead of creating a new one, set
 `existing_tenant_id` and leave `tenant_name` empty - `signup_key` is then unused.
+Supply `tenant_api_key` for that existing tenant, or an `admin_jwt` scoped to it.
+New tenants automatically use the key returned by their creation request.
 
 See `examples/basic/` for a complete, runnable example.
 
 ## Development
 
-No test suite - this module has no logic to unit test beyond what Terraform's own
-`validate` covers. If you have the Terraform CLI installed:
+If you have the Terraform CLI installed:
 
 ```bash
 terraform fmt -check -recursive
@@ -75,5 +77,7 @@ terraform init -backend=false
 terraform validate
 ```
 
-This was authored without a local Terraform CLI available to run those commands
-against; if `validate` surfaces anything, please open an issue.
+Verified with Terraform 1.9.8 on Windows against a disposable local backend:
+tenant creation, quota updates, and alert channel creation succeeded, and a second
+plan reported no changes. Windows uses PowerShell with curl.exe; Unix uses /bin/sh
+with curl. Verify apply against your own test deployment before provisioning real tenants.

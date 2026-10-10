@@ -1,135 +1,62 @@
-import { useState, type FormEvent } from 'react';
+import { useEffect, useState, type FormEvent } from 'react';
 import logoImg from '../assets/logo.png';
-import { API_BASE } from '../lib/api';
+import { getAuthOptions, loginDashboard, type DashboardUser } from '../lib/api';
 
-interface LoginProps {
-  onLoginSuccess: (token: string) => void;
-}
-
-export default function Login({ onLoginSuccess }: LoginProps) {
-  const [subject, setSubject] = useState('security_admin');
+export default function Login({ onLoginSuccess }: { onLoginSuccess: (user: DashboardUser) => void }) {
+  const [email, setEmail] = useState('');
+  const [subject, setSubject] = useState('');
+  const [demo, setDemo] = useState(false);
+  const [demoAvailable, setDemoAvailable] = useState(false);
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const inputClass = 'w-full px-4 py-3 bg-slate-900/50 border border-slate-700/50 rounded-lg text-slate-100 placeholder:text-slate-600 focus:outline-none focus:border-cyber-cyan/50 focus:ring-1 focus:ring-cyber-cyan/25';
+  useEffect(() => { getAuthOptions().then(options => setDemoAvailable(options.demo_login_available)).catch(() => {}); }, []);
 
-  const handleSubmit = async (e: FormEvent) => {
-    e.preventDefault();
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
     setError('');
     setLoading(true);
-
     try {
-      const res = await fetch(`${API_BASE}/auth/login`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ subject, password }),
-      });
-
-      if (!res.ok) {
-        const data = await res.json();
-        throw new Error(data.detail || 'Authentication failed');
-      }
-
-      const { access_token } = await res.json();
-      onLoginSuccess(access_token);
+      const { user } = await loginDashboard((demo ? subject : email).trim(), password, demo);
+      setPassword('');
+      onLoginSuccess(user);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Login failed');
+      setError(err instanceof Error ? err.message : 'Sign in failed');
     } finally {
       setLoading(false);
     }
   };
 
-  return (
-    <div className="cyber-grid-bg min-h-screen text-slate-200 font-sans flex items-center justify-center selection:bg-rose-900 selection:text-white antialiased">
-      <div className="w-full max-w-md mx-4">
-        {/* Card Container */}
-        <div className="border border-cyber-border/60 bg-cyber-panel/95 backdrop-blur-lg rounded-xl shadow-2xl p-8">
-          {/* Logo & Branding */}
-          <div className="text-center mb-8">
-            <div className="inline-block mb-4">
-              <img src={logoImg} alt="CyberAccess" className="h-12 w-12" />
-            </div>
-            <h1 className="text-2xl font-bold text-white mb-2">CyberAccess</h1>
-            <p className="text-sm text-slate-400">BOLA Defense Platform</p>
-          </div>
-
-          {/* Heading */}
-          <div className="mb-6">
-            <h2 className="text-xl font-semibold text-slate-100">Security Dashboard</h2>
-            <p className="text-sm text-slate-400 mt-1">Real-time threat intelligence and access control</p>
-          </div>
-
-          {/* Form */}
-          <form onSubmit={handleSubmit} className="space-y-4">
-            {/* Subject/Username Field */}
-            <div>
-              <label className="block text-xs font-semibold text-slate-300 mb-2 uppercase tracking-wide">
-                Subject / Admin ID
-              </label>
-              <input
-                type="text"
-                value={subject}
-                onChange={(e) => setSubject(e.target.value)}
-                placeholder="security_admin"
-                className="w-full px-4 py-2.5 bg-slate-900/50 border border-slate-700/50 rounded-lg text-slate-100 placeholder:text-slate-600 focus:outline-none focus:border-cyber-cyan/50 focus:ring-1 focus:ring-cyber-cyan/25 transition"
-              />
-            </div>
-
-            {/* Password Field */}
-            <div>
-              <label className="block text-xs font-semibold text-slate-300 mb-2 uppercase tracking-wide">
-                Password
-              </label>
-              <input
-                type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder="Enter your password"
-                className="w-full px-4 py-2.5 bg-slate-900/50 border border-slate-700/50 rounded-lg text-slate-100 placeholder:text-slate-600 focus:outline-none focus:border-cyber-cyan/50 focus:ring-1 focus:ring-cyber-cyan/25 transition"
-              />
-            </div>
-
-            {/* Error Message */}
-            {error && (
-              <div className="px-4 py-3 bg-rose-900/20 border border-rose-500/30 rounded-lg">
-                <p className="text-sm text-rose-300">{error}</p>
-              </div>
-            )}
-
-            {/* Submit Button */}
-            <button
-              type="submit"
-              disabled={loading}
-              className="w-full mt-6 px-4 py-2.5 bg-gradient-to-r from-cyber-cyan to-blue-500 hover:from-cyber-cyan/90 hover:to-blue-500/90 disabled:from-slate-700 disabled:to-slate-700 disabled:opacity-50 text-white font-semibold rounded-lg transition duration-200 shadow-lg shadow-cyber-cyan/20"
-            >
-              {loading ? 'Signing In...' : 'Sign In to Dashboard'}
-            </button>
-          </form>
-
-          {/* Footer Info */}
-          <div className="mt-6 pt-6 border-t border-slate-700/30">
-            <p className="text-xs text-slate-500 text-center">
-              Default: <span className="text-slate-300">security_admin</span> / <span className="text-slate-300">admin_changeme123</span>
-            </p>
-            <p className="text-xs text-slate-500 text-center mt-3">
-              Integrating CyberAccess into your own app?{' '}
-              <a href="/signup" className="text-cyber-cyan hover:underline">Get an API key</a>
-            </p>
-          </div>
-
-          {/* Security Notice */}
-          <div className="mt-4 p-3 bg-slate-900/50 border border-slate-700/30 rounded-lg">
-            <p className="text-xs text-slate-400">
-              <span className="font-semibold text-cyber-cyan">🔒 Secure Connection:</span> All data encrypted in transit. This dashboard monitors real-time BOLA attacks and access control decisions.
-            </p>
-          </div>
+  return <div className="cyber-grid-bg min-h-screen text-slate-200 flex items-center justify-center p-4">
+    <main className="w-full max-w-md border border-cyber-border/60 bg-cyber-panel/95 rounded-xl shadow-2xl p-8">
+      <img src={logoImg} alt="" className="h-12 w-12 mb-6" />
+      <p className="text-xs font-mono tracking-widest text-cyber-cyan uppercase mb-2">CyberAccess console</p>
+      <h1 className="text-2xl font-semibold text-white">Sign in to your dashboard</h1>
+      <p className="text-sm text-slate-400 mt-2 mb-6">Your organization's traffic, risk decisions and audit history in one place.</p>
+      <form onSubmit={submit} className="space-y-4">
+        <div>
+          <label htmlFor="login-email" className="block text-sm text-slate-300 mb-2">{demo ? 'Demo user ID' : 'Email'}</label>
+          <input id="login-email" type={demo ? 'text' : 'email'} autoComplete="username" required
+            value={demo ? subject : email} onChange={e => demo ? setSubject(e.target.value) : setEmail(e.target.value)}
+            placeholder={demo ? 'Your configured demo user' : 'you@company.com'} className={inputClass} />
         </div>
-
-        {/* Bottom Info */}
-        <div className="mt-8 text-center text-xs text-slate-500">
-          <p>CyberAccess BOLA Defense Platform v1.1.1</p>
-          <p className="mt-1">© 2026 Security Team. All rights reserved.</p>
+        <div>
+          <label htmlFor="login-password" className="block text-sm text-slate-300 mb-2">Password</label>
+          <input id="login-password" type="password" autoComplete="current-password" required value={password}
+            onChange={e => setPassword(e.target.value)} className={inputClass} />
         </div>
+        {error && <p role="alert" className="p-3 rounded-lg border border-rose-500/30 bg-rose-900/20 text-sm text-rose-300">{error}</p>}
+        <button type="submit" disabled={loading} className="w-full rounded-lg bg-cyber-cyan px-4 py-3 text-slate-950 font-semibold disabled:opacity-50">
+          {loading ? 'Signing in...' : 'Open dashboard'}
+        </button>
+      </form>
+      <div className="border-t border-slate-700/40 mt-6 pt-5 space-y-3 text-sm text-slate-400">
+        <p>New here? <a href="/signup" className="text-cyber-cyan hover:underline">Create your account</a></p>
+        <p>Already have an API key? <a href="/claim" className="text-cyber-cyan hover:underline">Enable dashboard access</a></p>
+        {demoAvailable && <label className="flex gap-2 items-center text-xs pt-2"><input type="checkbox" checked={demo}
+          onChange={e => { setDemo(e.target.checked); setPassword(''); setError(''); }} /> Use a demo user instead</label>}
       </div>
-    </div>
-  );
+    </main>
+  </div>;
 }

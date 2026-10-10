@@ -10,6 +10,6 @@ slowapi==0.1.9
 joblib==1.6.0
 pandas==3.0.5
 strawberry-graphql[fastapi]>=0.327.0
-psycopg[binary]==3.2.1
+psycopg[binary,pool]==3.3.5
 redis==5.2.1
 prometheus-client==0.21.0

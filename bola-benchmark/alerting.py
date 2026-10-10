@@ -6,6 +6,7 @@ import json
 import os
 import smtplib
 import asyncio
+import html
 import httpx
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -45,14 +46,14 @@ class AlertDispatcher:
             msg["Subject"] = subject
 
             # HTML email
-            html = f"""
+            html_body = f"""
             <html>
               <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
                 <div style="max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #ddd; border-radius: 8px;">
                   <h2 style="color: #e74c3c;">CyberAccess Security Alert</h2>
                   <p><strong>Alert Type:</strong> {alert_type.upper()}</p>
                   <hr style="border: none; border-top: 1px solid #ddd; margin: 20px 0;">
-                  <div>{body}</div>
+                  <div>{html.escape(body)}</div>
                   <hr style="border: none; border-top: 1px solid #ddd; margin: 20px 0;">
                   <p style="font-size: 12px; color: #666;">
                     This is an automated alert from CyberAccess BOLA Defense System.
@@ -62,15 +63,15 @@ class AlertDispatcher:
               </body>
             </html>
             """
-            msg.attach(MIMEText(html, "html"))
+            msg.attach(MIMEText(html_body, "html"))
 
             # Send (non-blocking via thread pool)
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(
-                None,
-                lambda: smtplib.SMTP(SMTP_HOST, SMTP_PORT).starttls()
-                or smtplib.SMTP(SMTP_HOST, SMTP_PORT).sendmail(SMTP_USER, recipient, msg.as_string())
-            )
+            def send():
+                with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=ALERT_EMAIL_TIMEOUT) as server:
+                    server.starttls()
+                    server.login(SMTP_USER, SMTP_PASSWORD)
+                    server.sendmail(SMTP_USER, recipient, msg.as_string())
+            await asyncio.to_thread(send)
             return True
         except Exception as e:
             print(f"[alerting] Email failed: {e}")
@@ -149,17 +150,21 @@ async def dispatch_alerts(
         return
 
     try:
-        with db() as c:
-            channels = c.execute(
-                "SELECT id, channel_type, channel_config FROM alert_channels "
-                "WHERE tenant_id = %s AND is_active = true",
-                (tenant_id,)
-            ).fetchall()
+        def load_channels():
+            with db() as c:
+                return c.execute(
+                    "SELECT id, channel_type, channel_config FROM alert_channels "
+                    "WHERE tenant_id = %s AND is_active = true", (tenant_id,)
+                ).fetchall()
+        channels = await asyncio.to_thread(load_channels)
 
         tasks = []
         for channel in channels:
             ch_type = channel["channel_type"]
-            config = json.loads(channel["channel_config"])
+            try:
+                config = json.loads(channel["channel_config"])
+            except (TypeError, ValueError):
+                continue
 
             if ch_type == "email" and "address" in config:
                 tasks.append(

@@ -500,7 +500,8 @@ def test_f9_canary_trip_in_graphql():
 
 def test_events_stream_sse_broadcast():
     """SSE endpoint connects and streams initial heartbeat and events."""
-    res = client.get("/events/stream?max_events=1")
+    assert client.get("/events/stream?max_events=1").status_code == 401
+    res = client.get("/events/stream?max_events=1", headers=auth_headers(ADMIN_ROLE, ADMIN_PASSWORD))
     assert res.status_code == 200
     assert "text/event-stream" in res.headers["content-type"]
     assert "ping" in res.text
@@ -529,7 +530,9 @@ def test_forensic_merkle_audit_proof():
     res = client.get("/forensics/audit-proof", headers=headers)
     assert res.status_code == 200
     proof = res.json()
-    assert proof["ledger_valid"] is True
+    assert proof["ledger_valid"] is None
+    verified = client.get("/forensics/audit-proof", headers=headers, params={"expected_root": proof["merkle_root"]})
+    assert verified.json()["ledger_valid"] is True
     assert proof["merkle_root"].startswith("0x")
     assert "compliance_posture" in proof
     assert proof["compliance_posture"]["owasp_api1_2023"].startswith("PROTECTED")

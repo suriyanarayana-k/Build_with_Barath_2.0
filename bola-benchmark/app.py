@@ -3,8 +3,8 @@
 Backed by Postgres (not SQLite) so it can run as a real, horizontally-scaled
 service shared by multiple customers ("tenants"), each isolated by tenant_id.
 Two front doors:
-  - The JWT-authenticated demo/dashboard API (unchanged in spirit from before),
-    scoped to a single seeded "demo" tenant.
+  - The tenant dashboard with revocable HttpOnly user sessions, plus the
+    legacy JWT-authenticated demo API.
   - The API-key-authenticated product API (/v1/*) other companies' backends
     call on every request instead of hosting their whole API through us.
 """
@@ -20,6 +20,7 @@ import secrets
 import sys
 import time
 from contextlib import contextmanager
+from functools import wraps
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -57,6 +58,7 @@ import strawberry
 from strawberry.fastapi import GraphQLRouter
 import redis
 from prometheus_client import Counter, Histogram, Gauge, generate_latest, REGISTRY
+from database import db, DATABASE_BACKEND, has_column
 
 # Database migrations
 from migrations import apply_migrations, compute_audit_hash
@@ -82,6 +84,12 @@ ADMIN_ROLE = "security_admin"
 DEMO_TENANT_ID = "demo"
 TENANT_SIGNUP_KEY = os.environ.get("TENANT_SIGNUP_KEY", "dev-insecure-signup-key-change-in-production")
 BCRYPT_ROUNDS = int(os.environ.get("BCRYPT_ROUNDS", "4" if APP_ENV in ("dev", "test") else "12"))
+CONSOLE_COOKIE_NAME = "cyberaccess_session"
+CONSOLE_COOKIE_SECURE = (os.environ.get("CONSOLE_COOKIE_SECURE") or str(APP_ENV == "prod")).lower() == "true"
+CONSOLE_PASSWORD_MIN_LENGTH = int(os.environ.get("CONSOLE_PASSWORD_MIN_LENGTH", "12"))
+CONSOLE_AUTH_RATE_LIMIT = os.environ.get("CONSOLE_AUTH_RATE_LIMIT", "10/minute")
+if not 8 <= CONSOLE_PASSWORD_MIN_LENGTH <= 72:
+    raise RuntimeError("CONSOLE_PASSWORD_MIN_LENGTH must be between 8 and 72")
 _CACHED_DEMO_HASH = bcrypt.hashpw(DEMO_PASSWORD.encode(), bcrypt.gensalt(rounds=BCRYPT_ROUNDS)).decode()
 _CACHED_ADMIN_HASH = bcrypt.hashpw(ADMIN_PASSWORD.encode(), bcrypt.gensalt(rounds=BCRYPT_ROUNDS)).decode()
 
@@ -98,8 +106,11 @@ BOLA_ASYNC_JOB_TTL = float(os.environ.get("BOLA_ASYNC_JOB_TTL", "3600.0"))
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 redis_client = None
 try:
-    redis_client = redis.from_url(REDIS_URL, decode_responses=True)
-    redis_client.ping()
+    if not REDIS_URL:
+        raise ValueError("REDIS_URL is empty")
+    _redis = redis.from_url(REDIS_URL, decode_responses=True, socket_connect_timeout=1, socket_timeout=1)
+    _redis.ping()
+    redis_client = _redis
     print("[init] ✅ Redis connected")
 except Exception as e:
     print(f"[init] ⚠️  Redis unavailable: {e} (caching disabled)")
@@ -208,99 +219,7 @@ _ENDPOINT_MODEL_PATH = Path(__file__).with_name("models") / "endpoint_anomaly_mo
 endpoint_anomaly_model = joblib.load(_ENDPOINT_MODEL_PATH) if _ENDPOINT_MODEL_PATH.exists() else None
 
 
-# Using SQLite3 for all environments (removed PostgreSQL)
-import sqlite3
-import re
 from threading import RLock, Thread
-
-_db_lock = RLock()
-_sqlite_file = Path(__file__).parent / "bola.db"
-_raw_sqlite = sqlite3.connect(str(_sqlite_file), check_same_thread=False)
-_raw_sqlite.row_factory = sqlite3.Row
-try:
-    _raw_sqlite.execute("PRAGMA journal_mode=WAL")
-except Exception:
-    pass
-_raw_sqlite.execute("PRAGMA synchronous=NORMAL")
-_raw_sqlite.execute("PRAGMA busy_timeout=5000")
-
-class SQLiteCursorWrapper:
-    def __init__(self, cur):
-        self.cur = cur
-
-    def _transform_sql(self, sql: str) -> str:
-        s = sql.replace("SERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
-        s = s.replace("DOUBLE PRECISION", "REAL")
-        s = s.replace("BOOLEAN", "INTEGER")
-        s = re.sub(r'\bNOW\(\)', 'CURRENT_TIMESTAMP', s, flags=re.IGNORECASE)
-        s = re.sub(r'\bTEXT\[\]', 'TEXT', s)
-        s = re.sub(r'\ballowed\s*=\s*false\b', 'allowed = 0', s, flags=re.IGNORECASE)
-        s = re.sub(r'\ballowed\s*=\s*true\b', 'allowed = 1', s, flags=re.IGNORECASE)
-        s = re.sub(r'\bctid\b', 'rowid', s)
-        s = re.sub(r'%s', '?', s)
-        return s
-
-    def execute(self, sql, params=None):
-        s = self._transform_sql(sql)
-        if params is not None:
-            p = [int(x) if isinstance(x, bool) else x for x in params]
-            self.cur.execute(s, p)
-        else:
-            stmts = [stmt.strip() for stmt in s.split(";") if stmt.strip()]
-            if len(stmts) > 1:
-                self.cur.executescript(s)
-            else:
-                self.cur.execute(s)
-        return self
-
-    def executemany(self, sql, seq_of_params):
-        s = self._transform_sql(sql)
-        p_seq = [[int(x) if isinstance(x, bool) else x for x in params] for params in seq_of_params]
-        self.cur.executemany(s, p_seq)
-        return self
-
-    def fetchone(self):
-        r = self.cur.fetchone()
-        return dict(r) if r is not None else None
-
-    def fetchall(self):
-        return [dict(r) for r in self.cur.fetchall()]
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        pass
-
-class SQLiteConnWrapper:
-    def __init__(self, conn):
-        self.conn = conn
-
-    def cursor(self):
-        return SQLiteCursorWrapper(self.conn.cursor())
-
-    def execute(self, sql, params=None):
-        cur = self.cursor()
-        cur.execute(sql, params)
-        return cur
-
-    def commit(self):
-        self.conn.commit()
-
-    def rollback(self):
-        self.conn.rollback()
-
-_sqlite_wrapper = SQLiteConnWrapper(_raw_sqlite)
-
-@contextmanager
-def db():
-    with _db_lock:
-        try:
-            yield _sqlite_wrapper
-            _sqlite_wrapper.commit()
-        except Exception:
-            _sqlite_wrapper.rollback()
-            raise
 
 
 def hash_api_key(key: str) -> str:
@@ -514,6 +433,11 @@ def init_schema() -> None:
     ):
         try:
             with db() as c:
+                column_match = re.match(r"ALTER TABLE (\w+) ADD COLUMN (\w+)", migration_sql)
+                if column_match and has_column(c, *column_match.groups()):
+                    continue
+                if DATABASE_BACKEND == "SQLite" and "ALTER COLUMN" in migration_sql:
+                    continue
                 c.execute(migration_sql)
         except Exception as exc:
             # Swallowed on purpose for the common case (column/constraint
@@ -521,7 +445,7 @@ def init_schema() -> None:
             # errors) - but logged, not fully silent, so a genuinely new
             # migration failure shows up instead of vanishing the way this
             # exact class of bug did before.
-            print(f"[schema migration] skipped ({exc.__class__.__name__}): {migration_sql}")
+            raise RuntimeError(f"Schema migration failed: {migration_sql}") from exc
 
 
 def get_system_config(key: str, default: str | None = None) -> str | None:
@@ -570,7 +494,7 @@ def seed_demo_tenant(force: bool = False) -> None:
             if existing:
                 return
 
-        for table in ("access_grants", "assignments", "records", "users",
+        for table in ("access_grants", "assignments", "records",
                        "risk_events", "risk_strikes", "risk_blocks", "risk_bans",
                        "resource_nodes", "async_jobs", "stored_references",
                        "abac_policies", "abac_field_redactions", "canary_records", "canary_triggers",
@@ -591,7 +515,8 @@ def seed_demo_tenant(force: bool = False) -> None:
                  + [(f"attacker_{j}", "customer", demo_hash) for j in range(1, 11)]
                  + [(f"sybil_{j}", "customer", demo_hash) for j in range(1, 51)])
         cur.executemany(
-            "INSERT INTO users (tenant_id, id, role, password_hash) VALUES (%s, %s, %s, %s)",
+            "INSERT INTO users (tenant_id, id, role, password_hash) VALUES (%s, %s, %s, %s) "
+            "ON CONFLICT (tenant_id, id) DO UPDATE SET role = EXCLUDED.role, password_hash = EXCLUDED.password_hash",
             [(DEMO_TENANT_ID, *u) for u in users],
         )
         records = [(str(i), "alice" if i <= 50 else "bob", f"confidential record {i}") for i in range(1, 101)]
@@ -752,7 +677,7 @@ def authorization_context(tenant_id: str, subject: str, record_id: int | str, ac
         # Admin override (security_admin role has read/audit oversight)
         user_row = c.execute("SELECT role FROM users WHERE tenant_id = %s AND id = %s", (tenant_id, subject)).fetchone()
         user_role = user_row["role"] if user_row else None
-        if user_role == ADMIN_ROLE or subject == ADMIN_ROLE:
+        if user_role == ADMIN_ROLE:
             return {"authorization": "admin", "explanations": ["Access allowed: security_admin administrative authority."], "delegation": None}
 
         # Owner check (owner has all permissions: read, write, delete)
@@ -944,53 +869,79 @@ class BehavioralRiskEngine:
         return float(row["at"]) if row else 0.0
 
     def register_strike_and_block(self, tenant_id: str, subject: str, now: float) -> tuple[float, str, int]:
-        current_blocked_until = self.blocked_until(tenant_id, subject)
-        if current_blocked_until > now:
-            count = self.get_strike_count(tenant_id, subject, now)
-            rem = current_blocked_until - now
-            if self._ban_status(tenant_id, subject) == "approved":
-                signal = "strike_3_permanent_ban_approved"
-            elif count == 1:
-                signal = "strike_1_soft_lockout_2m"
-            elif count == 2:
-                signal = "strike_2_hard_lockout_30m"
-            else:
-                signal = "strike_3_pending_admin_approval"
-            return rem, signal, max(1, count)
-
         with db() as c:
+            self._lock_subject_state(c, tenant_id, subject)
+            cutoff = now - self.strike_window
+            c.execute("DELETE FROM risk_strikes WHERE tenant_id = %s AND subject = %s AND at <= %s",
+                      (tenant_id, subject, cutoff))
+            count = c.execute("SELECT COUNT(*) AS n FROM risk_strikes WHERE tenant_id = %s AND subject = %s",
+                              (tenant_id, subject)).fetchone()["n"]
+            block = c.execute("SELECT blocked_until FROM risk_blocks WHERE tenant_id = %s AND subject = %s",
+                              (tenant_id, subject)).fetchone()
+            ban = c.execute("SELECT status FROM risk_bans WHERE tenant_id = %s AND subject = %s",
+                            (tenant_id, subject)).fetchone()
+            status = ban["status"] if ban else None
+            if block and block["blocked_until"] > now:
+                if status == "approved":
+                    signal = "strike_3_permanent_ban_approved"
+                elif count == 1:
+                    signal = "strike_1_soft_lockout_2m"
+                elif count == 2:
+                    signal = "strike_2_hard_lockout_30m"
+                else:
+                    signal = "strike_3_pending_admin_approval"
+                return block["blocked_until"] - now, signal, max(1, count)
+
             c.execute("INSERT INTO risk_strikes (tenant_id, subject, at) VALUES (%s, %s, %s)",
                       (tenant_id, subject, now))
-        count = self.get_strike_count(tenant_id, subject, now)
+            count += 1
+            if status == "approved":
+                lockout, signal = 315360000.0, "strike_3_permanent_ban_approved"
+            elif count == 1:
+                lockout, signal = 120.0, "strike_1_soft_lockout_2m"
+            elif count == 2:
+                lockout, signal = 1800.0, "strike_2_hard_lockout_30m"
+            else:
+                c.execute("INSERT INTO risk_bans (tenant_id, subject, status) VALUES (%s, %s, 'pending') "
+                          "ON CONFLICT (tenant_id, subject) DO UPDATE SET status = EXCLUDED.status",
+                          (tenant_id, subject))
+                lockout, signal = 1800.0, "strike_3_pending_admin_approval"
 
-        if count == 1:
-            lockout, signal = 120.0, "strike_1_soft_lockout_2m"
-        elif count == 2:
-            lockout, signal = 1800.0, "strike_2_hard_lockout_30m"
-        elif self._ban_status(tenant_id, subject) == "approved":
-            lockout, signal = 315360000.0, "strike_3_permanent_ban_approved"
-        else:
-            self._set_ban_status(tenant_id, subject, "pending")
-            lockout, signal = 1800.0, "strike_3_pending_admin_approval"
-
-        self._set_blocked_until(tenant_id, subject, now + lockout)
+            c.execute("INSERT INTO risk_blocks (tenant_id, subject, blocked_until) VALUES (%s, %s, %s) "
+                      "ON CONFLICT (tenant_id, subject) DO UPDATE SET blocked_until = EXCLUDED.blocked_until",
+                      (tenant_id, subject, now + lockout))
         return lockout, signal, count
+
+    @staticmethod
+    def _lock_subject_state(c, tenant_id: str, subject: str) -> None:
+        # SQLite holds its transaction lock; PostgreSQL needs a lock shared by all workers.
+        if DATABASE_BACKEND == "PostgreSQL":
+            key = int.from_bytes(hashlib.sha256(json.dumps([tenant_id, subject]).encode()).digest()[:8], signed=True)
+            c.execute("SELECT pg_advisory_xact_lock(%s)", (key,))
 
     def approve_permanent_ban(self, tenant_id: str, subject: str, now: float | None = None) -> bool:
         now = now or time.time()
-        self._set_ban_status(tenant_id, subject, "approved")
-        self._set_blocked_until(tenant_id, subject, now + 315360000.0)
+        with db() as c:
+            self._lock_subject_state(c, tenant_id, subject)
+            c.execute("INSERT INTO risk_bans (tenant_id, subject, status) VALUES (%s, %s, 'approved') "
+                      "ON CONFLICT (tenant_id, subject) DO UPDATE SET status = EXCLUDED.status", (tenant_id, subject))
+            c.execute("INSERT INTO risk_blocks (tenant_id, subject, blocked_until) VALUES (%s, %s, %s) "
+                      "ON CONFLICT (tenant_id, subject) DO UPDATE SET blocked_until = EXCLUDED.blocked_until",
+                      (tenant_id, subject, now + 315360000.0))
         return True
 
     def reject_permanent_ban(self, tenant_id: str, subject: str, now: float | None = None) -> bool:
         now = now or time.time()
-        self._clear_ban_status(tenant_id, subject)
         with db() as c:
+            self._lock_subject_state(c, tenant_id, subject)
+            c.execute("DELETE FROM risk_bans WHERE tenant_id = %s AND subject = %s", (tenant_id, subject))
             row = c.execute("SELECT ctid FROM risk_strikes WHERE tenant_id = %s AND subject = %s ORDER BY at DESC LIMIT 1",
                              (tenant_id, subject)).fetchone()
             if row:
                 c.execute("DELETE FROM risk_strikes WHERE ctid = %s", (row["ctid"],))
-        self._set_blocked_until(tenant_id, subject, now + 60.0)
+            c.execute("INSERT INTO risk_blocks (tenant_id, subject, blocked_until) VALUES (%s, %s, %s) "
+                      "ON CONFLICT (tenant_id, subject) DO UPDATE SET blocked_until = EXCLUDED.blocked_until",
+                      (tenant_id, subject, now + 60.0))
         return True
 
     def pending_bans(self, tenant_id: str) -> list[str]:
@@ -1067,7 +1018,8 @@ class BehavioralRiskEngine:
 
         unseen = False
         decision = "allow" if allowed else "deny"
-        if score >= 90:
+        block_threshold, _warn_threshold = get_tenant_risk_thresholds(tenant_id)
+        if score >= block_threshold:
             decision = "block"
             if register_strike:
                 lockout, strike_sig, count = self.register_strike_and_block(tenant_id, subject, now)
@@ -1212,14 +1164,16 @@ class BehavioralRiskEngine:
             elif strike_count == 1 and "strike_1_soft_lockout_2m" not in signals:
                 signals.append("strike_1_soft_lockout_2m")
             category = "Attack"
-        elif score < 40:
-            category = "Normal"
-        elif score < 70:
-            category = "Suspicious"
-        elif score < 90:
-            category = "High Risk"
         else:
-            category = "Attack"
+            block_threshold, warn_threshold = get_tenant_risk_thresholds(tenant_id)
+            if score >= block_threshold:
+                category = "Attack"
+            elif score >= warn_threshold:
+                category = "High Risk"
+            elif score >= min(40, warn_threshold):
+                category = "Suspicious"
+            else:
+                category = "Normal"
 
         return {"score": max(0.0, min(100.0, float(score))), "signals": signals, "category": category, "contributions": contributions}
 
@@ -1228,10 +1182,10 @@ engine = BehavioralRiskEngine()
 app = FastAPI(title="BOLA Graph Benchmark", version="1.1.1")
 
 # ===== PROMETHEUS METRICS (Enterprise Observability) =====
-authorize_counter = Counter('authorize_decisions_total', 'Total authorization decisions', ['decision', 'tenant_id'])
+authorize_counter = Counter('authorize_decisions_total', 'Product API authorization decisions', ['decision', 'tenant_id'])
 authorize_latency = Histogram('authorize_latency_seconds', 'Authorization latency', ['tenant_id'], buckets=[0.01, 0.02, 0.05, 0.1, 0.2, 0.5])
 risk_score_histogram = Histogram('risk_score_distribution', 'Risk score distribution', ['tenant_id'], buckets=[0, 20, 40, 60, 80, 90, 100])
-false_positives_counter = Counter('false_positives_total', 'False positive blocks', ['tenant_id'])
+authorized_blocks_counter = Counter('authorized_request_blocks_total', 'Behavioral blocks on otherwise authorized requests', ['tenant_id'])
 audit_events_stored = Gauge('audit_events_stored_total', 'Total audit events stored', ['tenant_id'])
 tenant_quota_usage = Gauge('tenant_quota_usage_percent', 'Tenant quota usage %', ['tenant_id'])
 redis_cache_hits = Counter('redis_cache_hits_total', 'Redis cache hits', ['cache_type'])
@@ -1247,21 +1201,47 @@ threat_behavioral_anomaly_flags = Counter('threat_behavioral_anomaly_flags_total
 def extract_client_ip(request: Request) -> str:
     """Best-effort client IP: prefer the first hop of X-Forwarded-For (set by an upstream
     proxy/load balancer in production), else the direct connection's address."""
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        first_hop = forwarded.split(",")[0].strip()
-        if first_hop:
-            return first_hop
+    # Uvicorn resolves forwarded addresses only for configured trusted proxies.
     return request.client.host if request.client else "unknown"
 
 # Metrics endpoint for Prometheus scraping
 @app.get("/metrics")
 def metrics():
+    with db() as c:
+        counts = c.execute("SELECT tenant_id, COUNT(*) AS n FROM audit_events GROUP BY tenant_id").fetchall()
+    audit_events_stored.clear()
+    for row in counts:
+        audit_events_stored.labels(tenant_id=row["tenant_id"]).set(row["n"])
     return Response(generate_latest(REGISTRY), media_type="text/plain")
 
+
+def observe_authorization(handler):
+    @wraps(handler)
+    def measured(*args, **kwargs):
+        tenant_id = kwargs.get("tenant_id") or args[2]
+        payload = kwargs.get("payload") if "payload" in kwargs else args[1]
+        started = time.perf_counter()
+        try:
+            result = handler(*args, **kwargs)
+        finally:
+            authorize_latency.labels(tenant_id=tenant_id).observe(time.perf_counter() - started)
+        decisions = result.get("results", [result])
+        inputs = payload.get("items", []) if "results" in result else [payload]
+        for decision, item in zip(decisions, inputs):
+            authorize_counter.labels(decision=decision["decision"], tenant_id=tenant_id).inc()
+            risk_score_histogram.labels(tenant_id=tenant_id).observe(decision["score"])
+            if decision["decision"] == "block" and item.get("authorized") is True:
+                authorized_blocks_counter.labels(tenant_id=tenant_id).inc()
+        return result
+    return measured
+
+
 _frontend_origins = [o.strip() for o in os.environ.get("FRONTEND_ORIGIN", "").split(",") if o.strip()]
-_cors_origins = _frontend_origins if _frontend_origins else (["*"] if APP_ENV != "prod" else [])
-app.add_middleware(CORSMiddleware, allow_origins=_cors_origins, allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
+_cors_origins = _frontend_origins
+_cors_local_regex = r"https?://(localhost|127\.0\.0\.1)(:\d+)?" if APP_ENV != "prod" else None
+if APP_ENV == "prod" and "*" in _frontend_origins:
+    raise RuntimeError("Cookie-authenticated dashboards require explicit FRONTEND_ORIGIN values in production")
+_cors_origins = [origin for origin in _cors_origins if origin != "*"]
 
 # ===== CONFIGURATION (Externalized to Environment Variables) =====
 # Redis Caching
@@ -1286,6 +1266,19 @@ ROI_ASSUMED_COST_PER_BREACH_USD = float(os.environ.get("ROI_ASSUMED_COST_PER_BRE
 ROI_ASSUMED_BREACH_PROBABILITY_PER_ATTACK = float(os.environ.get("ROI_ASSUMED_BREACH_PROBABILITY_PER_ATTACK", "0.02"))
 ROI_ASSUMED_MANUAL_REVIEW_MINUTES_PER_EVENT = float(os.environ.get("ROI_ASSUMED_MANUAL_REVIEW_MINUTES_PER_EVENT", "15"))
 ROI_ASSUMED_ENGINEER_HOURLY_COST_USD = float(os.environ.get("ROI_ASSUMED_ENGINEER_HOURLY_COST_USD", "75"))
+
+
+def get_tenant_risk_thresholds(tenant_id: str) -> tuple[int, int]:
+    with db() as c:
+        quota = c.execute(
+            "SELECT risk_threshold_block, risk_threshold_warn FROM tenant_quotas WHERE tenant_id = %s",
+            (tenant_id,),
+        ).fetchone()
+    return (
+        int(quota["risk_threshold_block"] or DEFAULT_RISK_THRESHOLD_BLOCK) if quota else DEFAULT_RISK_THRESHOLD_BLOCK,
+        int(quota["risk_threshold_warn"] or DEFAULT_RISK_THRESHOLD_WARN) if quota else DEFAULT_RISK_THRESHOLD_WARN,
+    )
+
 
 # ===== RATE LIMITING MIDDLEWARE (Per-Tenant) =====
 def _sync_load_or_default_quota(tenant_id: str, quota_key: str) -> str:
@@ -1322,7 +1315,15 @@ class TenantRateLimitMiddleware(BaseHTTPMiddleware):
     """Per-tenant rate limiting with quota enforcement."""
 
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        tenant_id = request.headers.get("X-Tenant-ID") or "demo"
+        # Only verified credentials identify a tenant. X-Tenant-ID is untrusted.
+        if request.method == "OPTIONS" or request.scope.get("console_session") or request.url.path.startswith("/auth/") or request.url.path in ("/health", "/healthz", "/metrics", "/v1/signup", "/v1/tenants"):
+            return await call_next(request)
+        if not request.headers.get("X-API-Key") and not request.headers.get("Authorization"):
+            return await call_next(request)
+        try:
+            tenant_id = await asyncio.to_thread(resolve_request_tenant, request.headers.get("X-API-Key"), request.headers.get("Authorization"))
+        except HTTPException as exc:
+            return Response(json.dumps({"detail": exc.detail}), status_code=exc.status_code, media_type="application/json")
 
         # Skip rate limiting for health/metrics endpoints
         if request.url.path in ["/health", "/metrics"]:
@@ -1334,7 +1335,7 @@ class TenantRateLimitMiddleware(BaseHTTPMiddleware):
         # async dispatch() would otherwise serialize every concurrent request
         # site-wide behind whichever one happens to be doing I/O.
         quota_key = f"quota:{tenant_id}"
-        quota_config = cache_get(quota_key)
+        quota_config = await asyncio.to_thread(cache_get, quota_key)
 
         if not quota_config:
             quota_config = await asyncio.to_thread(_sync_load_or_default_quota, tenant_id, quota_key)
@@ -1344,13 +1345,10 @@ class TenantRateLimitMiddleware(BaseHTTPMiddleware):
 
         # Check rate limit using Redis
         rate_limit_key = f"ratelimit:{tenant_id}"
-        current = 0
-        if redis_client:
+        current, retry_after = await asyncio.to_thread(_consume_tenant_quota, tenant_id)
+
+        if current:
             try:
-                current = redis_client.incr(rate_limit_key)
-                if current == 1:
-                    # New key, set expiry based on rate limit window
-                    redis_client.expire(rate_limit_key, RATE_LIMIT_WINDOW_SECONDS)
 
                 # Check if over limit
                 if current > rpm_limit:
@@ -1360,11 +1358,11 @@ class TenantRateLimitMiddleware(BaseHTTPMiddleware):
                             "error": "Rate limit exceeded",
                             "limit": rpm_limit,
                             "current": current,
-                            "retry_after": RATE_LIMIT_WINDOW_SECONDS
+                            "retry_after": retry_after
                         }),
                         status_code=429,
                         media_type="application/json",
-                        headers={"Retry-After": str(RATE_LIMIT_WINDOW_SECONDS)}
+                        headers={"Retry-After": str(retry_after)}
                     )
 
                 # Update quota usage metric
@@ -1389,13 +1387,39 @@ class TenantRateLimitMiddleware(BaseHTTPMiddleware):
                     except Exception:
                         pass
             except Exception:
-                pass  # If Redis fails, allow request (fail-open)
+                pass
 
         response = await call_next(request)
         response.headers["X-Tenant-ID"] = tenant_id
         response.headers["X-Quota-Used"] = str(current)
         response.headers["X-Quota-Limit"] = str(rpm_limit)
         return response
+
+
+def _consume_tenant_quota(tenant_id: str) -> tuple[int, int]:
+    if redis_client:
+        try:
+            result = redis_client.eval(
+                "local n = redis.call('INCR', KEYS[1]); "
+                "if n == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end; "
+                "return {n, redis.call('TTL', KEYS[1])}",
+                1, f"ratelimit:{tenant_id}", RATE_LIMIT_WINDOW_SECONDS,
+            )
+            return int(result[0]), max(1, int(result[1]))
+        except Exception:
+            pass
+    # Persisted fallback enforces quotas even when Redis is disabled.
+    now = time.time()
+    with db() as c:
+        row = c.execute(
+            "INSERT INTO rate_limit_state (tenant_id, current_requests, requests_reset_at, last_updated) "
+            "VALUES (%s, 1, %s, %s) ON CONFLICT (tenant_id) DO UPDATE SET "
+            "current_requests = CASE WHEN rate_limit_state.requests_reset_at <= %s THEN 1 ELSE rate_limit_state.current_requests + 1 END, "
+            "requests_reset_at = CASE WHEN rate_limit_state.requests_reset_at <= %s THEN EXCLUDED.requests_reset_at ELSE rate_limit_state.requests_reset_at END, "
+            "last_updated = EXCLUDED.last_updated RETURNING current_requests, requests_reset_at",
+            (tenant_id, now + RATE_LIMIT_WINDOW_SECONDS, now, now, now),
+        ).fetchone()
+    return row["current_requests"], max(1, int(row["requests_reset_at"] - now))
 
 app.add_middleware(TenantRateLimitMiddleware)
 
@@ -1427,50 +1451,68 @@ def extract_candidate_object_ids(payload: Any, depth: int = 5) -> list[tuple[str
     return candidates
 
 
+def _inspect_body_references(body_bytes: bytes, token: str, path: str) -> None:
+    try:
+        subject, _role, tenant_id = get_current_identity(f"Bearer {token}")
+        candidates = extract_candidate_object_ids(json.loads(body_bytes))
+    except (HTTPException, ValueError, KeyError):
+        return
+    for field_name, cand_id in candidates:
+        with db() as c:
+            rec = c.execute("SELECT owner_id FROM records WHERE tenant_id = %s AND id = %s", (tenant_id, cand_id)).fetchone()
+        if rec:
+            access = authorization_context(tenant_id, subject, cand_id, action="read")
+            if access["authorization"] is None:
+                decision, signals, unseen, score, category = engine.evaluate(tenant_id, subject, cand_id, allowed=False, endpoint=f"body_ref:{field_name}")
+                record_audit(tenant_id, subject, cand_id, None, decision, "denied_body_reference",
+                             [f"Unauthorized foreign object ID '{cand_id}' referenced in body field '{field_name}'."], risk_score=score)
+
+
 class BodyObjectReferenceMiddleware(BaseHTTPMiddleware):
     """Intercepts POST, PUT, and PATCH requests, dynamically identifies candidate
     resource identifiers in the JSON body, and verifies object authorization.
     If an unowned foreign resource is referenced, records a body-level BOLA attempt."""
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.method in ("POST", "PUT", "PATCH"):
+        if request.method in ("POST", "PUT", "PATCH") and not request.url.path.startswith("/auth/") and request.url.path not in ("/records/batch", "/hierarchy/access", "/graphql"):
             auth_header = request.headers.get("Authorization", "")
             if auth_header.lower().startswith("bearer "):
                 body_bytes = await request.body()
                 if body_bytes:
-                    try:
-                        token = auth_header.split(" ", 1)[1]
-                        payload_jwt = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-                        subject = payload_jwt["sub"]
-                        tenant_id = payload_jwt.get("tenant_id", DEMO_TENANT_ID)
-
-                        data = json.loads(body_bytes)
-                        candidates = extract_candidate_object_ids(data)
-
-                        for field_name, cand_id in candidates:
-                            if request.url.path.startswith("/auth/") or request.url.path in ("/records/batch", "/hierarchy/access", "/graphql"):
-                                continue
-                            with db() as c:
-                                rec = c.execute(
-                                    "SELECT owner_id FROM records WHERE tenant_id = %s AND id = %s",
-                                    (tenant_id, cand_id)
-                                ).fetchone()
-                            if rec:
-                                access = authorization_context(tenant_id, subject, cand_id, action="read")
-                                if access["authorization"] is None:
-                                    decision, signals, unseen, score, category = engine.evaluate(tenant_id, subject, cand_id, allowed=False, endpoint=f"body_ref:{field_name}")
-                                    record_audit(
-                                        tenant_id, subject, cand_id, None, "deny", "denied_body_reference",
-                                        [f"Unauthorized foreign object ID '{cand_id}' referenced in body field '{field_name}'."],
-                                        risk_score=score
-                                    )
-                    except Exception:
-                        pass
-                    async def receive():
-                        return {"type": "http.request", "body": body_bytes}
-                    request._receive = receive
+                    await asyncio.to_thread(_inspect_body_references, body_bytes, auth_header.split(" ", 1)[1], request.url.path)
         return await call_next(request)
 
 app.add_middleware(BodyObjectReferenceMiddleware)
+app.add_middleware(CORSMiddleware, allow_origins=_cors_origins, allow_origin_regex=_cors_local_regex,
+                   allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+
+class DashboardSessionMiddleware(BaseHTTPMiddleware):
+    """Adapt the browser's HttpOnly cookie to the existing tenant JWT boundary.
+
+    Explicit API credentials take precedence. Cookie-authenticated writes require
+    a custom header (HTML forms cannot send it) and an allowed browser Origin.
+
+    cookie -> write Origin/header check -> Bearer adapter -> verified JWT +
+    live dashboard_sessions row -> tenant-scoped route (never a caller tenant ID)
+    """
+    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+        token = request.cookies.get(CONSOLE_COOKIE_NAME)
+        if token and not request.headers.get("Authorization") and not request.headers.get("X-API-Key"):
+            if request.method not in ("GET", "HEAD", "OPTIONS"):
+                origin = request.headers.get("Origin")
+                local_origin = bool(_cors_local_regex and origin and re.fullmatch(_cors_local_regex, origin))
+                permitted_origin = not origin or origin == str(request.base_url).rstrip("/") or origin in _frontend_origins or local_origin
+                if request.headers.get("X-CyberAccess-Console") != "1" or not permitted_origin:
+                    return Response(json.dumps({"detail": "Invalid dashboard request origin"}), status_code=403, media_type="application/json")
+            request.scope["headers"] = list(request.scope["headers"]) + [(b"authorization", f"Bearer {token}".encode())]
+            request.scope["console_session"] = True
+        response = await call_next(request)
+        if request.scope.get("console_session"):
+            response.headers["Cache-Control"] = "no-store"
+        return response
+
+
+app.add_middleware(DashboardSessionMiddleware)
 
 
 @app.get("/health")
@@ -1479,6 +1521,8 @@ def health() -> dict:
 
 
 def _rate_limit_key(request: Request) -> str:
+    if request.url.path.startswith("/auth/") or request.url.path in ("/v1/signup", "/v1/tenants"):
+        return get_remote_address(request)
     authorization = request.headers.get("Authorization", "")
     if authorization.lower().startswith("bearer "):
         token = authorization.split(" ", 1)[1]
@@ -1498,9 +1542,11 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
-def create_access_token(subject: str, role: str, tenant_id: str) -> str:
+def create_access_token(subject: str, role: str, tenant_id: str, session_id: str | None = None) -> str:
     now = time.time()
     payload = {"sub": subject, "role": role, "tenant_id": tenant_id, "iat": now, "exp": now + JWT_EXPIRY_SECONDS}
+    if session_id:
+        payload["sid"] = session_id
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 
@@ -1516,7 +1562,20 @@ def get_current_identity(authorization: str | None = Header(default=None)) -> tu
         raise HTTPException(401, "Token expired, please log in again")
     except jwt.InvalidTokenError:
         raise HTTPException(401, "Invalid authentication token")
-    return payload["sub"], payload.get("role", "customer"), payload.get("tenant_id", DEMO_TENANT_ID)
+    if not isinstance(payload.get("sub"), str) or not isinstance(payload.get("tenant_id", DEMO_TENANT_ID), str):
+        raise HTTPException(401, "Invalid authentication token")
+    subject, role, tenant_id = payload["sub"], payload.get("role", "customer"), payload.get("tenant_id", DEMO_TENANT_ID)
+    if "sid" in payload:
+        with db() as c:
+            session = c.execute(
+                "SELECT u.role FROM dashboard_sessions s JOIN users u ON u.tenant_id = s.tenant_id AND u.id = s.subject_id "
+                "WHERE s.session_hash = %s AND s.tenant_id = %s AND s.subject_id = %s AND s.expires_at > %s",
+                (hash_api_key(str(payload["sid"])), tenant_id, subject, time.time()),
+            ).fetchone()
+        if not session:
+            raise HTTPException(401, "Dashboard session expired or signed out")
+        role = session["role"]
+    return subject, role, tenant_id
 
 
 def get_tenant_from_api_key(x_api_key: str | None = Header(default=None)) -> str:
@@ -1524,8 +1583,8 @@ def get_tenant_from_api_key(x_api_key: str | None = Header(default=None)) -> str
     the JWT user-login flow the demo dashboard uses."""
     if not x_api_key:
         raise HTTPException(401, "Missing X-API-Key header")
-    if x_api_key == "dev_test_key":
-        return "lost_found_dev"
+    if APP_ENV == "prod" and x_api_key in ("dev_test_key", "demo-key-unused"):
+        raise HTTPException(401, "Development API keys are disabled")
     with db() as c:
         row = c.execute("SELECT id FROM tenants WHERE api_key_hash = %s", (hash_api_key(x_api_key),)).fetchone()
     if not row:
@@ -1538,11 +1597,32 @@ def require_security_admin(role: str) -> None:
         raise HTTPException(403, f"This action requires the {ADMIN_ROLE} role")
 
 
-def guard_demo_endpoint(authorization: str | None = Header(default=None)) -> None:
+def resolve_request_tenant(x_api_key: str | None, authorization: str | None) -> str:
+    if x_api_key:
+        return get_tenant_from_api_key(x_api_key)
+    if authorization:
+        return get_current_identity(authorization)[2]
     if DEMO_MODE:
+        return DEMO_TENANT_ID
+    raise HTTPException(401, "Authentication required")
+
+
+def get_tenant_admin_identity(authorization: str | None = Header(default=None),
+                              x_api_key: str | None = Header(default=None)) -> tuple[str, str, str]:
+    if x_api_key:
+        return "api-key", ADMIN_ROLE, get_tenant_from_api_key(x_api_key)
+    return get_current_identity(authorization)
+
+
+def guard_demo_endpoint(authorization: str | None = Header(default=None), x_api_key: str | None = Header(default=None)) -> None:
+    if x_api_key and get_tenant_from_api_key(x_api_key) != DEMO_TENANT_ID:
+        raise HTTPException(403, "Demo controls are unavailable for customer tenants")
+    if DEMO_MODE and not authorization:
         return
-    subject, role, _tenant_id = get_current_identity(authorization)
+    subject, role, tenant_id = get_current_identity(authorization)
     require_security_admin(role)
+    if tenant_id != DEMO_TENANT_ID:
+        raise HTTPException(403, "Demo controls are unavailable for customer tenants")
 
 
 def explain_detector_signals(signals: list[str]) -> list[str]:
@@ -1601,25 +1681,203 @@ def register(request: Request, payload: dict) -> dict:
 
 
 @app.post("/auth/login")
-@limiter.limit("1000/minute")
-def login(request: Request, payload: dict) -> dict:
+@limiter.limit(CONSOLE_AUTH_RATE_LIMIT)
+def login(request: Request, response: Response, payload: dict) -> dict:
+    if "email" in payload:
+        email = _normalize_account_email(payload.get("email"))
+        password = payload.get("password")
+        with db() as c:
+            row = c.execute(
+                "SELECT a.subject_id, a.tenant_id, u.role, u.password_hash FROM dashboard_accounts a "
+                "JOIN users u ON u.tenant_id = a.tenant_id AND u.id = a.subject_id WHERE a.email = %s", (email,)
+            ).fetchone()
+        valid = _password_matches(password, row["password_hash"] if row else _CACHED_ADMIN_HASH)
+        if not row or not valid:
+            raise HTTPException(401, "Invalid email or password")
+        with db() as c:
+            return _issue_console_session(c, response, row["subject_id"], row["role"], row["tenant_id"])
     subject = payload.get("subject")
     password = payload.get("password")
-    if not subject or not password:
+    if not isinstance(subject, str) or not subject or not isinstance(password, str) or not password:
         raise HTTPException(400, "subject and password are required")
     with db() as c:
         row = c.execute("SELECT role, password_hash FROM users WHERE tenant_id = %s AND id = %s",
                          (DEMO_TENANT_ID, subject)).fetchone()
-    if not row or not bcrypt.checkpw(password.encode(), row["password_hash"].encode()):
+    valid = _password_matches(password, row["password_hash"] if row else _CACHED_ADMIN_HASH)
+    if not row or not valid:
         raise HTTPException(401, "Invalid subject or password")
+    if payload.get("console") is True:
+        with db() as c:
+            return _issue_console_session(c, response, subject, row["role"], DEMO_TENANT_ID)
     token = create_access_token(subject, row["role"], DEMO_TENANT_ID)
     return {"access_token": token, "token_type": "bearer", "subject": subject, "role": row["role"], "expires_in": JWT_EXPIRY_SECONDS}
 
 
 @app.get("/auth/me")
-def me(identity: tuple[str, str, str] = Depends(get_current_identity)) -> dict:
+def me(response: Response, identity: tuple[str, str, str] = Depends(get_current_identity)) -> dict:
     subject, role, tenant_id = identity
-    return {"subject": subject, "role": role, "tenant_id": tenant_id}
+    response.headers["Cache-Control"] = "no-store"
+    with db() as c:
+        return _dashboard_profile(c, subject, role, tenant_id)
+
+
+@app.get("/auth/options")
+def dashboard_auth_options() -> dict:
+    return {"password_min_length": CONSOLE_PASSWORD_MIN_LENGTH, "demo_login_available": DEMO_MODE}
+
+
+@app.get("/auth/session")
+def restore_dashboard_session(response: Response, authorization: str | None = Header(default=None)) -> dict:
+    response.headers["Cache-Control"] = "no-store"
+    if not authorization:
+        return {"user": None}
+    try:
+        subject, role, tenant_id = get_current_identity(authorization)
+    except HTTPException:
+        response.delete_cookie(CONSOLE_COOKIE_NAME, path="/", httponly=True, secure=CONSOLE_COOKIE_SECURE, samesite="lax")
+        return {"user": None}
+    with db() as c:
+        return {"user": _dashboard_profile(c, subject, role, tenant_id)}
+
+
+def _normalize_account_email(email: Any) -> str:
+    if not isinstance(email, str):
+        raise HTTPException(400, "A valid email address is required")
+    email = email.strip().lower()
+    if len(email) > 254 or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
+        raise HTTPException(400, "A valid email address is required")
+    return email
+
+
+def _validate_console_password(password: Any) -> str:
+    if not isinstance(password, str) or len(password) < CONSOLE_PASSWORD_MIN_LENGTH or len(password.encode()) > 72:
+        raise HTTPException(400, f"Password must have at least {CONSOLE_PASSWORD_MIN_LENGTH} characters and at most 72 UTF-8 bytes")
+    return password
+
+
+def _password_matches(password: Any, password_hash: str) -> bool:
+    if not isinstance(password, str) or not password or len(password.encode()) > 72:
+        return False
+    try:
+        return bcrypt.checkpw(password.encode(), password_hash.encode())
+    except ValueError:
+        return False
+
+
+def _dashboard_profile(c, subject: str, role: str, tenant_id: str) -> dict:
+    tenant = c.execute("SELECT name FROM tenants WHERE id = %s", (tenant_id,)).fetchone()
+    account = c.execute("SELECT email FROM dashboard_accounts WHERE tenant_id = %s AND subject_id = %s", (tenant_id, subject)).fetchone()
+    return {"subject": subject, "role": role, "tenant_id": tenant_id,
+            "tenant_name": tenant["name"] if tenant else tenant_id,
+            "email": account["email"] if account else None,
+            "capabilities": {"demo_controls": DEMO_MODE and tenant_id == DEMO_TENANT_ID and role == ADMIN_ROLE,
+                             "manage_api_key": bool(account and role == ADMIN_ROLE)}}
+
+
+def _issue_console_session(c, response: Response, subject: str, role: str, tenant_id: str) -> dict:
+    session_id = secrets.token_urlsafe(32)
+    c.execute("DELETE FROM dashboard_sessions WHERE expires_at <= %s", (time.time(),))
+    c.execute("INSERT INTO dashboard_sessions (session_hash, tenant_id, subject_id, expires_at) VALUES (%s, %s, %s, %s)",
+              (hash_api_key(session_id), tenant_id, subject, time.time() + JWT_EXPIRY_SECONDS))
+    token = create_access_token(subject, role, tenant_id, session_id=session_id)
+    response.set_cookie(CONSOLE_COOKIE_NAME, token, httponly=True, secure=CONSOLE_COOKIE_SECURE,
+                        samesite="lax", max_age=JWT_EXPIRY_SECONDS, path="/")
+    response.headers["Cache-Control"] = "no-store"
+    return {"user": _dashboard_profile(c, subject, role, tenant_id), "expires_in": JWT_EXPIRY_SECONDS}
+
+
+def _insert_dashboard_owner(c, tenant_id: str, email: str, password_hash: str) -> str:
+    subject = "dashboard_" + secrets.token_hex(16)
+    c.execute("INSERT INTO users (tenant_id, id, role, password_hash) VALUES (%s, %s, %s, %s)",
+              (tenant_id, subject, ADMIN_ROLE, password_hash))
+    claimed = c.execute("INSERT INTO dashboard_accounts (email, tenant_id, subject_id, created_at) VALUES (%s, %s, %s, %s) "
+                        "ON CONFLICT DO NOTHING RETURNING tenant_id", (email, tenant_id, subject, time.time())).fetchone()
+    if not claimed:
+        raise HTTPException(409, "This email or tenant already has a dashboard account. Please sign in.")
+    return subject
+
+
+@app.post("/auth/signup")
+@limiter.limit("5/hour")
+def dashboard_signup(request: Request, response: Response, payload: dict) -> dict:
+    name = _validate_tenant_name(payload.get("name"))
+    email = _normalize_account_email(payload.get("email"))
+    password = _validate_console_password(payload.get("password"))
+    password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt(rounds=BCRYPT_ROUNDS)).decode()
+    # One transaction: duplicate accounts or failed session creation cannot leave
+    # an orphan tenant or partial owner behind. Password hashing holds no DB lock.
+    with db() as c:
+        result = _insert_tenant_record(c, name, email)
+        subject = _insert_dashboard_owner(c, result["tenant_id"], email, password_hash)
+        result.update(_issue_console_session(c, response, subject, ADMIN_ROLE, result["tenant_id"]))
+    return result
+
+
+@app.post("/auth/claim-tenant")
+@limiter.limit(CONSOLE_AUTH_RATE_LIMIT)
+def claim_dashboard(request: Request, response: Response, payload: dict,
+                    x_api_key: str | None = Header(default=None)) -> dict:
+    tenant_id = get_tenant_from_api_key(x_api_key)
+    if tenant_id == DEMO_TENANT_ID:
+        raise HTTPException(403, "The demo tenant cannot be claimed")
+    email = _normalize_account_email(payload.get("email"))
+    password = _validate_console_password(payload.get("password"))
+    password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt(rounds=BCRYPT_ROUNDS)).decode()
+    with db() as c:
+        # Recheck key ownership inside the transaction in case a concurrent
+        # replacement revoked the credential after the initial verification.
+        tenant = c.execute("SELECT id FROM tenants WHERE id = %s AND api_key_hash = %s",
+                           (tenant_id, hash_api_key(x_api_key))).fetchone()
+        if not tenant:
+            raise HTTPException(401, "Invalid API key")
+        subject = _insert_dashboard_owner(c, tenant_id, email, password_hash)
+        return _issue_console_session(c, response, subject, ADMIN_ROLE, tenant_id)
+
+
+@app.post("/auth/logout")
+def dashboard_logout(request: Request, response: Response) -> dict:
+    token = request.cookies.get(CONSOLE_COOKIE_NAME)
+    if token:
+        try:
+            payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM], options={"verify_exp": False})
+            if "sid" in payload:
+                with db() as c:
+                    c.execute("DELETE FROM dashboard_sessions WHERE session_hash = %s", (hash_api_key(str(payload["sid"])),))
+        except jwt.InvalidTokenError:
+            pass
+    response.delete_cookie(CONSOLE_COOKIE_NAME, path="/", httponly=True, secure=CONSOLE_COOKIE_SECURE, samesite="lax")
+    response.headers["Cache-Control"] = "no-store"
+    return {"status": "signed_out"}
+
+
+@app.post("/auth/api-key/rotate")
+@limiter.limit(CONSOLE_AUTH_RATE_LIMIT)
+def replace_tenant_api_key(request: Request, response: Response, payload: dict,
+                           identity: tuple[str, str, str] = Depends(get_current_identity)) -> dict:
+    subject, role, tenant_id = identity
+    require_security_admin(role)
+    with db() as c:
+        owner = c.execute("SELECT u.password_hash, t.api_key_hash, t.name FROM dashboard_accounts a "
+                          "JOIN users u ON u.tenant_id = a.tenant_id AND u.id = a.subject_id "
+                          "JOIN tenants t ON t.id = a.tenant_id WHERE a.tenant_id = %s AND a.subject_id = %s",
+                          (tenant_id, subject)).fetchone()
+    if not owner:
+        raise HTTPException(403, "A tenant dashboard owner account is required")
+    if not _password_matches(payload.get("password"), owner["password_hash"]):
+        raise HTTPException(401, "Invalid password")
+    key = generate_api_key()
+    with db() as c:
+        changed = c.execute("UPDATE tenants SET api_key_hash = %s WHERE id = %s AND api_key_hash = %s RETURNING id",
+                            (hash_api_key(key), tenant_id, owner["api_key_hash"])).fetchone()
+        if not changed:
+            raise HTTPException(409, "The key was already replaced. Please retry.")
+        c.execute('INSERT INTO audit_events (tenant_id, occurred_at, subject_id, record_id, "authorization", '
+                  'detector_decision, outcome, explanation, risk_score) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)',
+                  (tenant_id, time.time(), subject, "api_key", "authorized", "allow", "key_replaced",
+                   "Dashboard owner replaced the tenant integration key; previous key revoked.", 0.0))
+    response.headers["Cache-Control"] = "no-store"
+    return {"tenant_id": tenant_id, "name": owner["name"], "api_key": key,
+            "warning": "Save this key now. Your previous key is revoked; update your server integration immediately."}
 
 
 @app.post("/reset")
@@ -1644,14 +1902,20 @@ def reset_demo_database(request: Request = None, _guard: None = Depends(guard_de
     }
 
 
-_sse_subscribers: list[asyncio.Queue] = []
+_sse_subscribers: list[tuple[str, asyncio.AbstractEventLoop, asyncio.Queue]] = []
 
 
 def broadcast_sse_event(event_type: str, data: dict) -> None:
     msg = {"event": event_type, "data": data, "timestamp": time.time()}
-    for q in list(_sse_subscribers):
+    for tenant_id, loop, q in list(_sse_subscribers):
+        if data.get("tenant_id") != tenant_id:
+            continue
         try:
-            q.put_nowait(msg)
+            def enqueue(queue=q):
+                if queue.full():
+                    queue.get_nowait()
+                queue.put_nowait(msg)
+            loop.call_soon_threadsafe(enqueue)
         except Exception:
             pass
 
@@ -1751,10 +2015,13 @@ def _run_threat_detection(request: Request, tenant_id: str, subject: str, endpoi
 
 
 @app.get("/events/stream")
-async def events_stream(request: Request, max_events: int | None = None):
+async def events_stream(request: Request, max_events: int | None = None,
+                        identity: tuple[str, str, str] = Depends(get_current_identity)):
+    require_security_admin(identity[1])
     async def event_generator():
-        queue = asyncio.Queue()
-        _sse_subscribers.append(queue)
+        queue = asyncio.Queue(maxsize=100)
+        subscription = (identity[2], asyncio.get_running_loop(), queue)
+        _sse_subscribers.append(subscription)
         events_sent = 0
         try:
             yield f"event: ping\ndata: {json.dumps({'status': 'connected', 'time': time.time()})}\n\n"
@@ -1776,8 +2043,8 @@ async def events_stream(request: Request, max_events: int | None = None):
                     if max_events and events_sent >= max_events:
                         break
         finally:
-            if queue in _sse_subscribers:
-                _sse_subscribers.remove(queue)
+            if subscription in _sse_subscribers:
+                _sse_subscribers.remove(subscription)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
@@ -2722,10 +2989,8 @@ def _extract_gql_identity(request: Request) -> tuple[str, str, str]:
     auth = request.headers.get("Authorization", "")
     if not auth.lower().startswith("bearer "):
         raise PermissionError("Authentication required: missing Bearer token")
-    token = auth.split(" ", 1)[1]
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        return payload["sub"], payload.get("role", "customer"), payload.get("tenant_id", DEMO_TENANT_ID)
+        return get_current_identity(auth)
     except Exception as e:
         raise PermissionError(f"Invalid authentication token: {str(e)}")
 
@@ -2877,31 +3142,37 @@ def get_invoice(invoice_id: str, response: Response, identity: tuple[str, str, s
     raise HTTPException(403, detail={"outcome": "denied", "score": score, "category": category})
 
 @app.get("/config")
-def get_config() -> dict:
+def get_config(authorization: str | None = Header(default=None), x_api_key: str | None = Header(default=None)) -> dict:
+    tenant_id = resolve_request_tenant(x_api_key, authorization)
+    block_threshold, warn_threshold = get_tenant_risk_thresholds(tenant_id)
     return {
         "short_window": engine.short_window,
         "long_window": engine.long_window,
         "rapid_threshold": engine.rapid_threshold,
         "slow_threshold": engine.slow_threshold,
+        "risk_threshold_block": block_threshold,
+        "risk_threshold_warn": warn_threshold,
         "strike_1_duration": "2m (Soft)",
         "strike_2_duration": "30m (Hard)",
         "strike_3_duration": "Permanent (Blacklist)",
         "ai_anomaly_detection": "IsolationForest (scikit-learn)",
         "auth": "JWT bearer tokens (HS256) for the dashboard; per-tenant API keys for /v1/*",
-        "state_backend": "Postgres (multi-tenant, tenant_id-scoped)"
+        "state_backend": f"{DATABASE_BACKEND} (multi-tenant, tenant_id-scoped)"
     }
 
 @app.get("/stats")
-def get_stats() -> dict:
+def get_stats(authorization: str | None = Header(default=None), x_api_key: str | None = Header(default=None)) -> dict:
+    tenant_id = resolve_request_tenant(x_api_key, authorization)
     now = time.time()
-    engine.cleanup_stale(DEMO_TENANT_ID)
+    engine.cleanup_stale(tenant_id)
     with db() as c:
-        active_cnt = len(c.execute("SELECT DISTINCT subject FROM risk_events WHERE tenant_id = %s AND at > %s", (DEMO_TENANT_ID, now - 3600)).fetchall())
-        blocked_cnt = len(c.execute("SELECT DISTINCT subject FROM risk_blocks WHERE tenant_id = %s AND blocked_until > %s", (DEMO_TENANT_ID, now)).fetchall())
+        active_cnt = len(c.execute("SELECT DISTINCT subject FROM risk_events WHERE tenant_id = %s AND at > %s", (tenant_id, now - 3600)).fetchall())
+        blocked_cnt = len(c.execute("SELECT DISTINCT subject FROM risk_blocks WHERE tenant_id = %s AND blocked_until > %s", (tenant_id, now)).fetchall())
     return {
-        "active_subjects": max(active_cnt, engine.active_subject_count(DEMO_TENANT_ID)),
-        "blocked_subjects": max(blocked_cnt, engine.blocked_subject_count(DEMO_TENANT_ID)),
-        "coordinated_attacks": engine.coordinated_attacks(DEMO_TENANT_ID)
+        "tenant_id": tenant_id,
+        "active_subjects": max(active_cnt, engine.active_subject_count(tenant_id)),
+        "blocked_subjects": max(blocked_cnt, engine.blocked_subject_count(tenant_id)),
+        "coordinated_attacks": engine.coordinated_attacks(tenant_id)
     }
 
 @app.get("/events")
@@ -2911,7 +3182,7 @@ def get_events(identity: tuple[str, str, str] = Depends(get_current_identity)) -
     with db() as c:
         rows = c.execute(
             'SELECT id, occurred_at, subject_id, record_id, "authorization", detector_decision, outcome, explanation, risk_score '
-            "FROM audit_events WHERE (tenant_id = %s OR %s = 'demo') ORDER BY id DESC LIMIT 100", (tenant_id, tenant_id)).fetchall()
+            "FROM audit_events WHERE tenant_id = %s ORDER BY id DESC LIMIT 100", (tenant_id,)).fetchall()
     return {"events": [dict(row) for row in rows]}
 
 @app.get("/audit-timeline")
@@ -2920,19 +3191,23 @@ def get_audit_timeline(identity: tuple[str, str, str] = Depends(get_current_iden
     _subject, role, tenant_id = identity
     require_security_admin(role)
     clamped_limit = max(1, min(limit, 200))
+    patterns = (
+        ("record_id", "%404%"), ("record_id", "%canary%"), ("record_id", "%trap%"),
+        ("record_id", "%probe%"), ("record_id", "%fuzz%"), ("record_id", "%admin%"),
+        ("record_id", "%timer%"), ("record_id", "%quarantine%"),
+        ("record_id", "item_%"), ("record_id", "claim_%"), ("record_id", "record_%"),
+        ("explanation", "%strike%"), ("explanation", "%attack%"), ("explanation", "%violation%"),
+    )
+    pattern_sql = " OR ".join(f"{column} LIKE %s" for column, _pattern in patterns)
     with db() as c:
         rows = c.execute(
             'SELECT id, occurred_at, subject_id, record_id, "authorization", detector_decision, outcome, explanation, risk_score '
-            "FROM audit_events WHERE (tenant_id = %s OR %s = 'demo' OR tenant_id = 'lost_found_dev') AND ("
+            "FROM audit_events WHERE tenant_id = %s AND ("
             "  detector_decision != 'allow' OR "
             "  outcome != 'allowed' OR "
-            "  \"authorization\" != 'authorized' OR "
-            "  record_id LIKE '%404%' OR record_id LIKE '%canary%' OR record_id LIKE '%trap%' OR "
-            "  record_id LIKE '%probe%' OR record_id LIKE '%fuzz%' OR record_id LIKE '%admin%' OR "
-            "  record_id LIKE '%timer%' OR record_id LIKE '%quarantine%' OR "
-            "  record_id LIKE 'item_%' OR record_id LIKE 'claim_%' OR record_id LIKE 'record_%' OR "
-            "  explanation LIKE '%strike%' OR explanation LIKE '%attack%' OR explanation LIKE '%violation%'"
-            ") ORDER BY occurred_at DESC, id DESC LIMIT %s", (tenant_id, tenant_id, clamped_limit)).fetchall()
+            "  \"authorization\" != 'authorized' OR " + pattern_sql +
+            ") ORDER BY occurred_at DESC, id DESC LIMIT %s",
+            (tenant_id, *(pattern for _column, pattern in patterns), clamped_limit)).fetchall()
     timeline = []
     for row in rows:
         timeline.append({
@@ -2944,6 +3219,7 @@ def get_audit_timeline(identity: tuple[str, str, str] = Depends(get_current_iden
             "outcome": row["outcome"],
             "event_type": _classify_event(row["record_id"], row["detector_decision"]),
             "details": row["explanation"],
+            "risk_score": row["risk_score"],
         })
     return {"timeline": timeline, "total": len(timeline)}
 
@@ -2965,56 +3241,16 @@ def _classify_event(record_id: str, decision: str) -> str:
     return "denied_access"
 
 @app.get("/lockout-status/{subject}")
-def get_lockout_status(subject: str, x_api_key: str | None = Header(default=None), tenant: str | None = None) -> dict:
+def get_lockout_status(subject: str, x_api_key: str | None = Header(default=None), tenant: str | None = None,
+                       authorization: str | None = Header(default=None)) -> dict:
     """Returns lockout timer status for a subject (strike count, time remaining, expiry timestamp)."""
     now = time.time()
+    target_tenant = resolve_request_tenant(x_api_key, authorization)
+    if tenant and tenant != target_tenant:
+        raise HTTPException(403, "Tenant access denied")
     try:
-        target_tenant = DEMO_TENANT_ID
-        if x_api_key:
-            if x_api_key == "dev_test_key":
-                target_tenant = "lost_found_dev"
-            else:
-                try:
-                    with db() as c:
-                        t_row = c.execute("SELECT id FROM tenants WHERE api_key_hash = %s", (hash_api_key(x_api_key),)).fetchone()
-                        if t_row:
-                            target_tenant = t_row["id"]
-                except Exception:
-                    pass
-        elif tenant:
-            target_tenant = tenant
-
-        # If tenant is still default DEMO_TENANT_ID, check if this subject exists in another tenant (blocks or strikes)
-        if target_tenant == DEMO_TENANT_ID:
-            with db() as c:
-                # 1. Check active blocks first
-                b_row = c.execute(
-                    "SELECT tenant_id FROM risk_blocks WHERE subject = %s AND blocked_until > %s ORDER BY blocked_until DESC LIMIT 1",
-                    (subject, now)
-                ).fetchone()
-                if b_row:
-                    target_tenant = b_row["tenant_id"]
-                else:
-                    # 2. Check existing strikes (retains strike history across cooldown expiration!)
-                    s_row = c.execute(
-                        "SELECT tenant_id FROM risk_strikes WHERE subject = %s ORDER BY at DESC LIMIT 1",
-                        (subject,)
-                    ).fetchone()
-                    if s_row:
-                        target_tenant = s_row["tenant_id"]
-
         # Check blocked_until in target tenant
         blocked_until = engine.blocked_until(target_tenant, subject)
-        if blocked_until <= now:
-            # Fallback: check if actively blocked in ANY tenant
-            with db() as c:
-                b_row = c.execute(
-                    "SELECT tenant_id, blocked_until FROM risk_blocks WHERE subject = %s AND blocked_until > %s ORDER BY blocked_until DESC LIMIT 1",
-                    (subject, now)
-                ).fetchone()
-                if b_row:
-                    target_tenant = b_row["tenant_id"]
-                    blocked_until = b_row["blocked_until"]
 
         strike_count = engine.get_strike_count(target_tenant, subject, now)
 
@@ -3056,23 +3292,13 @@ def get_lockout_status(subject: str, x_api_key: str | None = Header(default=None
             "message": "Quarantine period has expired"
         }
     except Exception as e:
-        logger.warning(f"Error getting lockout status: {str(e)}")
-        return {
-            "subject": subject,
-            "strike_count": 0,
-            "is_locked": False,
-            "error": str(e)
-        }
+        raise HTTPException(503, "Lockout status is temporarily unavailable") from e
 
 
 @app.get("/risk/{subject}")
-def get_risk(subject: str) -> dict:
+def get_risk(subject: str, x_api_key: str | None = Header(default=None), authorization: str | None = Header(default=None)) -> dict:
     now = time.time()
-    tenant_id = DEMO_TENANT_ID
-    with db() as c:
-        row = c.execute("SELECT tenant_id FROM risk_events WHERE subject = %s ORDER BY at DESC LIMIT 1", (subject,)).fetchone()
-    if row:
-        tenant_id = row["tenant_id"]
+    tenant_id = resolve_request_tenant(x_api_key, authorization)
     res = engine.compute_risk(tenant_id, subject, now)
     strikes = engine.get_strike_count(tenant_id, subject, now)
     blocked_until = engine.blocked_until(tenant_id, subject)
@@ -3092,7 +3318,8 @@ def get_risk(subject: str) -> dict:
         "is_pending_ban": is_pending,
         "is_approved_ban": is_approved,
         "is_permanent": is_approved,
-        "lockout_remaining_s": remaining
+        "lockout_remaining_s": remaining,
+        "lockout_expires_at": int(blocked_until) if is_blocked else None,
     }
 
 
@@ -3181,18 +3408,22 @@ def get_record_graph_risk(record_id: str, identity: tuple[str, str, str] = Depen
 # authorized for the resource (their own object model, not ours) - this
 # endpoint's job is purely the behavioral/risk layer on top of that decision.
 
-def _create_tenant_record(name: str, email: Optional[str] = None) -> dict:
+def _insert_tenant_record(c, name: str, email: Optional[str] = None) -> dict:
     tenant_id = secrets.token_hex(8)
     api_key = generate_api_key()
-    with db() as c:
-        c.execute("INSERT INTO tenants (id, name, api_key_hash, created_at, email) VALUES (%s, %s, %s, %s, %s)",
-                  (tenant_id, name, hash_api_key(api_key), time.time(), email))
+    c.execute("INSERT INTO tenants (id, name, api_key_hash, created_at, email) VALUES (%s, %s, %s, %s, %s)",
+              (tenant_id, name, hash_api_key(api_key), time.time(), email))
     return {
         "tenant_id": tenant_id,
         "name": name,
         "api_key": api_key,
         "warning": "This API key is shown once and cannot be retrieved again - store it securely.",
     }
+
+
+def _create_tenant_record(name: str, email: Optional[str] = None) -> dict:
+    with db() as c:
+        return _insert_tenant_record(c, name, email)
 
 
 @app.post("/v1/tenants")
@@ -3209,29 +3440,37 @@ def create_tenant(request: Request, payload: dict, x_signup_key: str | None = He
     return _create_tenant_record(name)
 
 
+def _validate_tenant_name(name: Any) -> str:
+    if not isinstance(name, str) or not name.strip() or len(name.strip()) > 200:
+        raise HTTPException(400, "name is required")
+    return name.strip()
+
+
+def _validate_and_create_tenant(name: Optional[str], email: Optional[str]) -> dict:
+    name = _validate_tenant_name(name)
+    if email is not None and (not isinstance(email, str) or len(email) > 254 or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email)):
+        raise HTTPException(400, "email must be a valid email address")
+    return _create_tenant_record(name, email)
+
+
 @app.post("/v1/signup")
 @limiter.limit("5/hour")
-def public_signup(request: Request, payload: dict) -> dict:
+def public_signup(request: Request, response: Response, payload: dict) -> dict:
     """Public self-serve tenant signup - no signup key required, meant to be called
     directly from a website's own signup form. Rate-limited per IP (5/hour) since,
     unlike /v1/tenants, this has no pre-shared secret gating who can call it."""
-    name = payload.get("name")
-    if not name or not str(name).strip():
-        raise HTTPException(400, "name is required")
-    email = payload.get("email")
-    if email is not None and (not isinstance(email, str) or "@" not in email):
-        raise HTTPException(400, "email must be a valid email address")
-    return _create_tenant_record(str(name).strip(), email)
+    response.headers["Cache-Control"] = "no-store"
+    return _validate_and_create_tenant(payload.get("name"), payload.get("email"))
 
 
 # ===== TENANT QUOTA MANAGEMENT (Phase 2) =====
 @app.get("/tenants/{tenant_id}/quota")
-def get_tenant_quota(tenant_id: str, identity: tuple[str, str, str] = Depends(get_current_identity)) -> dict:
+def get_tenant_quota(tenant_id: str, identity: tuple[str, str, str] = Depends(get_tenant_admin_identity)) -> dict:
     """Get quota configuration for a tenant."""
     _subject, role, current_tenant = identity
 
     # Allow admins to query any tenant, others only their own
-    if role != ADMIN_ROLE and current_tenant != tenant_id:
+    if current_tenant != tenant_id:
         raise HTTPException(403, "Insufficient permissions")
 
     with db() as c:
@@ -3244,11 +3483,11 @@ def get_tenant_quota(tenant_id: str, identity: tuple[str, str, str] = Depends(ge
     if not result:
         # Return defaults
         result = {
-            "requests_per_minute": 1000,
-            "max_stored_audit_events": 1000000,
-            "max_audit_retention_days": 365,
-            "risk_threshold_block": 90,
-            "risk_threshold_warn": 70
+            "requests_per_minute": DEFAULT_REQUESTS_PER_MINUTE,
+            "max_stored_audit_events": DEFAULT_MAX_AUDIT_EVENTS,
+            "max_audit_retention_days": DEFAULT_AUDIT_RETENTION_DAYS,
+            "risk_threshold_block": DEFAULT_RISK_THRESHOLD_BLOCK,
+            "risk_threshold_warn": DEFAULT_RISK_THRESHOLD_WARN
         }
 
     return {
@@ -3258,10 +3497,23 @@ def get_tenant_quota(tenant_id: str, identity: tuple[str, str, str] = Depends(ge
 
 
 @app.post("/tenants/{tenant_id}/quota")
-def update_tenant_quota(tenant_id: str, payload: dict, identity: tuple[str, str, str] = Depends(get_current_identity)) -> dict:
+def update_tenant_quota(tenant_id: str, payload: dict, identity: tuple[str, str, str] = Depends(get_tenant_admin_identity)) -> dict:
     """Update quota configuration for a tenant (admin only)."""
     _subject, role, _current_tenant = identity
     require_security_admin(role)
+    _require_own_tenant_or_admin(tenant_id, identity)
+
+    current = get_tenant_quota(tenant_id, identity)["quota"]
+    for key, value in payload.items():
+        if key not in current:
+            raise HTTPException(400, f"Unknown quota field: {key}")
+        if value is None:
+            continue
+        if type(value) is not int or value <= 0 or (key.startswith("risk_threshold") and value > 100):
+            raise HTTPException(400, f"Invalid quota value for {key}")
+        current[key] = value
+    if current["risk_threshold_warn"] > current["risk_threshold_block"]:
+        raise HTTPException(400, "Warning threshold must not exceed block threshold")
 
     with db() as c:
         c.execute(
@@ -3277,11 +3529,11 @@ def update_tenant_quota(tenant_id: str, payload: dict, identity: tuple[str, str,
             "updated_at = EXCLUDED.updated_at",
             (
                 tenant_id,
-                payload.get("requests_per_minute", 1000),
-                payload.get("max_stored_audit_events", 1000000),
-                payload.get("max_audit_retention_days", 365),
-                payload.get("risk_threshold_block", 90),
-                payload.get("risk_threshold_warn", 70),
+                current["requests_per_minute"],
+                current["max_stored_audit_events"],
+                current["max_audit_retention_days"],
+                current["risk_threshold_block"],
+                current["risk_threshold_warn"],
                 time.time()
             )
         )
@@ -3297,12 +3549,12 @@ def update_tenant_quota(tenant_id: str, payload: dict, identity: tuple[str, str,
 
 
 @app.get("/tenants/{tenant_id}/quota-usage")
-def get_tenant_quota_usage(tenant_id: str, identity: tuple[str, str, str] = Depends(get_current_identity)) -> dict:
+def get_tenant_quota_usage(tenant_id: str, identity: tuple[str, str, str] = Depends(get_tenant_admin_identity)) -> dict:
     """Get current quota usage for a tenant."""
     _subject, role, current_tenant = identity
 
     # Allow admins to query any tenant, others only their own
-    if role != ADMIN_ROLE and current_tenant != tenant_id:
+    if current_tenant != tenant_id:
         raise HTTPException(403, "Insufficient permissions")
 
     with db() as c:
@@ -3318,7 +3570,7 @@ def get_tenant_quota_usage(tenant_id: str, identity: tuple[str, str, str] = Depe
             (tenant_id,)
         ).fetchone()["cnt"]
 
-    quota_limits = dict(quota) if quota else {"requests_per_minute": 1000, "max_stored_audit_events": 1000000}
+    quota_limits = dict(quota) if quota else {"requests_per_minute": DEFAULT_REQUESTS_PER_MINUTE, "max_stored_audit_events": DEFAULT_MAX_AUDIT_EVENTS}
 
     # Get current requests from Redis
     requests_this_minute = 0
@@ -3327,6 +3579,11 @@ def get_tenant_quota_usage(tenant_id: str, identity: tuple[str, str, str] = Depe
             requests_this_minute = int(redis_client.get(f"ratelimit:{tenant_id}") or 0)
         except Exception:
             pass
+    else:
+        with db() as c:
+            state = c.execute("SELECT current_requests, requests_reset_at FROM rate_limit_state WHERE tenant_id = %s", (tenant_id,)).fetchone()
+        if state and state["requests_reset_at"] > time.time():
+            requests_this_minute = state["current_requests"]
 
     return {
         "tenant_id": tenant_id,
@@ -3347,13 +3604,13 @@ def get_tenant_quota_usage(tenant_id: str, identity: tuple[str, str, str] = Depe
 def create_alert_channel(
     tenant_id: str,
     payload: dict,
-    identity: tuple[str, str, str] = Depends(get_current_identity)
+    identity: tuple[str, str, str] = Depends(get_tenant_admin_identity)
 ) -> dict:
     """Create an alert channel (Slack, Email, Webhook) for a tenant."""
     _subject, role, current_tenant = identity
 
     # Allow admins to create for any tenant, others only their own
-    if role != ADMIN_ROLE and current_tenant != tenant_id:
+    if current_tenant != tenant_id:
         raise HTTPException(403, "Insufficient permissions")
 
     channel_type = payload.get("channel_type")  # "slack", "email", "webhook"
@@ -3377,12 +3634,12 @@ def create_alert_channel(
 @app.get("/tenants/{tenant_id}/alert-channels")
 def list_alert_channels(
     tenant_id: str,
-    identity: tuple[str, str, str] = Depends(get_current_identity)
+    identity: tuple[str, str, str] = Depends(get_tenant_admin_identity)
 ) -> dict:
     """List all alert channels for a tenant."""
     _subject, role, current_tenant = identity
 
-    if role != ADMIN_ROLE and current_tenant != tenant_id:
+    if current_tenant != tenant_id:
         raise HTTPException(403, "Insufficient permissions")
 
     with db() as c:
@@ -3408,11 +3665,12 @@ def list_alert_channels(
 def delete_alert_channel(
     tenant_id: str,
     channel_id: str,
-    identity: tuple[str, str, str] = Depends(get_current_identity)
+    identity: tuple[str, str, str] = Depends(get_tenant_admin_identity)
 ) -> dict:
     """Delete an alert channel."""
     _subject, role, _current_tenant = identity
     require_security_admin(role)
+    _require_own_tenant_or_admin(tenant_id, identity)
 
     with db() as c:
         c.execute(
@@ -3426,12 +3684,12 @@ def delete_alert_channel(
 @app.post("/tenants/{tenant_id}/test-alert")
 async def test_alert(
     tenant_id: str,
-    identity: tuple[str, str, str] = Depends(get_current_identity)
+    identity: tuple[str, str, str] = Depends(get_tenant_admin_identity)
 ) -> dict:
     """Send a test alert to all active channels for a tenant."""
     _subject, role, current_tenant = identity
 
-    if role != ADMIN_ROLE and current_tenant != tenant_id:
+    if current_tenant != tenant_id:
         raise HTTPException(403, "Insufficient permissions")
 
     # Dispatch test alert
@@ -3463,7 +3721,10 @@ def get_defense_status_api() -> dict:
 @app.post("/toggle-defense")
 @app.post("/v1/defense/toggle")
 @app.post("/defense/toggle")
-async def toggle_defense_api(request: Request) -> dict:
+async def toggle_defense_api(request: Request, identity: tuple[str, str, str] = Depends(get_current_identity)) -> dict:
+    require_security_admin(identity[1])
+    if not DEMO_MODE or identity[2] != DEMO_TENANT_ID:
+        raise HTTPException(403, "Defense toggling is only available for the demo tenant")
     target_state = None
     try:
         body = await request.json()
@@ -3477,7 +3738,7 @@ async def toggle_defense_api(request: Request) -> dict:
     else:
         new_state = target_state
 
-    set_defense_enabled(new_state)
+    await asyncio.to_thread(set_defense_enabled, new_state)
     return {
         "success": True,
         "defense_enabled": new_state,
@@ -3488,8 +3749,13 @@ async def toggle_defense_api(request: Request) -> dict:
 
 @app.post("/v1/authorize")
 @limiter.limit("1000/minute")
+@observe_authorization
 def v1_authorize(request: Request, payload: dict, tenant_id: str = Depends(get_tenant_from_api_key)) -> dict:
-    if not is_defense_enabled():
+    if not isinstance(payload.get("subject"), str) or not payload["subject"].strip() or payload.get("resource_id") is None:
+        raise HTTPException(400, "subject and resource_id are required")
+    if type(payload.get("authorized", False)) is not bool:
+        raise HTTPException(400, "authorized must be a boolean")
+    if tenant_id == DEMO_TENANT_ID and DEMO_MODE and not is_defense_enabled():
         return {
             "decision": "allow",
             "score": 0.0,
@@ -3506,7 +3772,7 @@ def v1_authorize(request: Request, payload: dict, tenant_id: str = Depends(get_t
 
     subject = payload.get("subject")
     resource_id = payload.get("resource_id")
-    authorized = bool(payload.get("authorized", False))
+    authorized = payload.get("authorized", False)
     http_verb = str(payload.get("http_verb", "GET")).upper()
     endpoint = str(payload.get("endpoint") or payload.get("resource_name") or "v1")
     if not subject or resource_id is None:
@@ -3542,7 +3808,7 @@ def v1_authorize(request: Request, payload: dict, tenant_id: str = Depends(get_t
             "lockout_expires_at": int(active_block),
             "strike_count": max(1, current_strikes),
             "max_strikes": 3,
-            "risk_tier": "Attack (90-100)",
+            "risk_tier": "Attack",
             "threat_intel": {"enabled": threat_detection.THREAT_DETECTION_ENABLED, "skipped": "subject_already_locked_out"},
         }
 
@@ -3551,20 +3817,17 @@ def v1_authorize(request: Request, payload: dict, tenant_id: str = Depends(get_t
         tenant_id, subject, resource_id, authorized, endpoint=endpoint, http_verb=http_verb, register_strike=False
     )
 
-    is_canary = str(resource_id).strip() in ("0", "999999", "canary_admin_vault") or endpoint == "canary_trap"
+    is_canary = is_canary_record(tenant_id, str(resource_id).strip())
     is_admin = endpoint.startswith("admin_") or str(resource_id).startswith("privileged_admin") or endpoint in ("admin_login_probe", "admin_portal")
 
-    if not authorized:
+    block_threshold, warn_threshold = get_tenant_risk_thresholds(tenant_id)
+    if not authorized or score >= block_threshold:
         strike_now = time.time()
-        # Point tiers from specification:
-        # • 0–39   -> totally fine, allowed / normal denial
-        # • 40–69  -> suspicious, just logged/flagged quietly
-        # • 70–89  -> high risk, logged more seriously
-        # • 90–100 -> treated as an active attack, triggers a strike
-        if score >= 90.0 or is_canary:
+        # Tenant thresholds control escalation; object authorization remains authoritative.
+        if score >= block_threshold or is_canary:
             decision = "block"
             category = "Attack"
-            score = max(score, 100.0 if is_canary else 90.0)
+            score = max(score, 100.0 if is_canary else float(block_threshold))
             if is_canary and "canary_honeypot_triggered" not in signals:
                 signals.append("canary_honeypot_triggered")
             if is_admin and "unauthorized_admin_access_attempt" not in signals:
@@ -3576,14 +3839,12 @@ def v1_authorize(request: Request, payload: dict, tenant_id: str = Depends(get_t
             if strike_sig not in signals:
                 signals.append(strike_sig)
             current_strikes = count
-        elif score >= 70.0:
-            # 70–89 -> high risk, logged more seriously
+        elif score >= warn_threshold:
             decision = "deny"
             category = "High Risk"
             if "high_risk_reconnaissance" not in signals:
                 signals.append("high_risk_reconnaissance")
-        elif score >= 40.0:
-            # 40–69 -> suspicious, just logged/flagged quietly
+        elif score >= min(40, warn_threshold):
             decision = "deny"
             category = "Suspicious"
         else:
@@ -3630,7 +3891,7 @@ def v1_authorize(request: Request, payload: dict, tenant_id: str = Depends(get_t
         "lockout_expires_at": expires_at,
         "strike_count": max(1, strike_count) if final_decision == "block" else strike_count,
         "max_strikes": 3,
-        "risk_tier": "Normal (0-39)" if score < 40 else ("Suspicious (40-69)" if score < 70 else ("High Risk (70-89)" if score < 90 else "Attack (90-100)")),
+        "risk_tier": category,
         "threat_intel": threat_intel,
     }
 
@@ -3657,36 +3918,42 @@ def log_timer_audit(payload: dict, tenant_id: str = Depends(get_tenant_from_api_
 
 
 @app.post("/hackathon/release")
-def hackathon_release(payload: dict) -> dict:
+def hackathon_release(payload: dict, identity: tuple[str, str, str] = Depends(get_current_identity)) -> dict:
     """Bypass endpoint for hackathon demo to immediately release active quarantines.
     Preserves strike history so Strike 2 / Strike 3 test cycles proceed naturally.
     """
+    require_security_admin(identity[1])
+    tenant_id = identity[2]
     subject = str(payload.get("subject", "")).strip()
     client_ip = str(payload.get("client_ip", "")).strip()
     full_reset = bool(payload.get("full_reset", False))
     with db() as c:
         for sub in (subject, client_ip):
             if sub:
-                c.execute("DELETE FROM risk_blocks WHERE subject = %s", (sub,))
-                c.execute("DELETE FROM risk_bans WHERE subject = %s AND status != 'approved'", (sub,))
+                c.execute("DELETE FROM risk_blocks WHERE tenant_id = %s AND subject = %s", (tenant_id, sub))
+                c.execute("DELETE FROM risk_bans WHERE tenant_id = %s AND subject = %s AND status != 'approved'", (tenant_id, sub))
                 if full_reset:
-                    c.execute("DELETE FROM risk_strikes WHERE subject = %s", (sub,))
-                    c.execute("DELETE FROM risk_bans WHERE subject = %s", (sub,))
-                    c.execute("DELETE FROM risk_events WHERE subject = %s", (sub,))
+                    c.execute("DELETE FROM risk_strikes WHERE tenant_id = %s AND subject = %s", (tenant_id, sub))
+                    c.execute("DELETE FROM risk_bans WHERE tenant_id = %s AND subject = %s", (tenant_id, sub))
+                    c.execute("DELETE FROM risk_events WHERE tenant_id = %s AND subject = %s", (tenant_id, sub))
     return {"status": "released", "subject": subject, "client_ip": client_ip, "full_reset": full_reset}
 
 
 @app.post("/v1/authorize-batch")
 @limiter.limit("200/minute")
+@observe_authorization
 def v1_authorize_batch(request: Request, payload: dict, tenant_id: str = Depends(get_tenant_from_api_key)) -> dict:
     subject = payload.get("subject")
     items = payload.get("items", [])
-    if not subject or not isinstance(items, list):
+    if not isinstance(subject, str) or not subject.strip() or not isinstance(items, list):
         raise HTTPException(400, "subject and items array are required")
     if len(items) > BOLA_MAX_BATCH_SIZE:
         raise HTTPException(400, f"Batch size cannot exceed {BOLA_MAX_BATCH_SIZE} items")
+    if any(not isinstance(item, dict) or item.get("resource_id") is None
+           or type(item.get("authorized", False)) is not bool for item in items):
+        raise HTTPException(400, "Each batch item needs a resource_id and boolean authorized")
 
-    if not is_defense_enabled():
+    if tenant_id == DEMO_TENANT_ID and DEMO_MODE and not is_defense_enabled():
         return {
             "total": len(items),
             "blocked_mid_batch": False,
@@ -3709,6 +3976,9 @@ def v1_authorize_batch(request: Request, payload: dict, tenant_id: str = Depends
             blocked_mid_batch = True
             dispatch_soc_alert(tenant_id, subject, rid, sc, cat, sigs)
         final_dec = "block" if dec == "block" else ("allow" if auth else "deny")
+        record_audit(tenant_id, subject, rid, "authorized" if auth else None, final_dec,
+                     "blocked" if final_dec == "block" else ("allowed" if auth else "denied"),
+                     explain_detector_signals(sigs), risk_score=sc)
         results.append({"resource_id": rid, "decision": final_dec, "score": sc, "signals": sigs})
 
     return {"total": len(items), "blocked_mid_batch": blocked_mid_batch, "results": results}
@@ -3832,9 +4102,8 @@ def execute_redteam_campaign(request: Request, payload: dict, _guard: None = Dep
 
 
 @app.get("/forensics/audit-proof")
-def get_forensic_audit_proof(identity: tuple[str, str, str] = Depends(get_current_identity)) -> dict:
-    """Verifies and returns a cryptographically chained SHA-256 Merkle proof of the audit ledger
-    for HIPAA, GDPR, and OWASP API1:2023 compliance attestation."""
+def get_forensic_audit_proof(identity: tuple[str, str, str] = Depends(get_current_identity), expected_root: str | None = None) -> dict:
+    """Hash a snapshot of all audit fields; verify only against an independently saved root."""
     _subject, _role, tenant_id = identity
     with db() as c:
         rows = c.execute(
@@ -3844,36 +4113,36 @@ def get_forensic_audit_proof(identity: tuple[str, str, str] = Depends(get_curren
     if not rows:
         genesis_hash = hashlib.sha256(f"GENESIS:{tenant_id}".encode()).hexdigest()
         return {
-            "ledger_valid": True,
+            "ledger_valid": hmac.compare_digest(f"0x{genesis_hash}", expected_root) if expected_root else None,
             "total_events_verified": 0,
             "merkle_root": f"0x{genesis_hash}",
             "first_event_at": None,
             "latest_event_at": None,
             "compliance_posture": {
                 "owasp_api1_2023": "PROTECTED",
-                "hipaa_164_312": "COMPLIANT",
-                "gdpr_art_32": "VERIFIED",
-                "soc2_cc6": "AUDITED"
+                "hipaa_164_312": "NOT_ASSESSED",
+                "gdpr_art_32": "NOT_ASSESSED",
+                "soc2_cc6": "NOT_ASSESSED"
             },
             "chain_algorithm": "SHA-256-HASH-CHAIN"
         }
 
     running_hash = hashlib.sha256(f"GENESIS:{tenant_id}".encode()).hexdigest()
     for row in rows:
-        block_content = f"{running_hash}|{row['id']}|{row['occurred_at']}|{row['subject_id']}|{row['record_id']}|{row['outcome']}|{row['risk_score']}"
+        block_content = running_hash + "|" + json.dumps(dict(row), sort_keys=True, separators=(",", ":"))
         running_hash = hashlib.sha256(block_content.encode()).hexdigest()
 
     return {
-        "ledger_valid": True,
+        "ledger_valid": hmac.compare_digest(f"0x{running_hash}", expected_root) if expected_root else None,
         "total_events_verified": len(rows),
         "merkle_root": f"0x{running_hash}",
         "first_event_at": rows[0]["occurred_at"],
         "latest_event_at": rows[-1]["occurred_at"],
         "compliance_posture": {
             "owasp_api1_2023": "PROTECTED (Active Multi-Layer Engine)",
-            "hipaa_164_312": "COMPLIANT (§164.312(a)(1) Access Control & §164.312(b) Audit Controls)",
-            "gdpr_art_32": "VERIFIED (Security of Processing - Pseudonymization & Cryptographic Integrity)",
-            "soc2_cc6": "AUDITED (Logical and Physical Access Controls)"
+            "hipaa_164_312": "NOT_ASSESSED",
+            "gdpr_art_32": "NOT_ASSESSED",
+            "soc2_cc6": "NOT_ASSESSED"
         },
         "chain_algorithm": "SHA-256-HASH-CHAIN"
     }
@@ -3911,11 +4180,11 @@ def get_compliance_report(
         ).fetchone()["cnt"]
 
         # Check for any audit log modifications (should be 0)
-        modifications = 0  # Append-only ensures this
+        modifications = None  # No independent modification monitor is configured.
 
     # Generate compliance attestation
     now = time.time()
-    attestation_id = f"attst_{tenant_id}_{int(now)}"
+    attestation_id = f"attst_{tenant_id}_{secrets.token_hex(8)}"
 
     compliance_details = {
         "HIPAA": {
@@ -3928,7 +4197,7 @@ def get_compliance_report(
             "controls": {
                 "access_control": "IMPLEMENTED",
                 "audit_logging": "IMPLEMENTED",
-                "encryption": "IN_TRANSIT_AND_AT_REST",
+                "encryption": "DEPLOYMENT_DEPENDENT_NOT_ASSESSED",
                 "access_reviews": "AUTOMATED"
             },
             "findings": {
@@ -3946,14 +4215,14 @@ def get_compliance_report(
             ],
             "controls": {
                 "pseudonymisation": "ENABLED",
-                "data_encryption": "AES-256",
+                "data_encryption": "DEPLOYMENT_DEPENDENT_NOT_ASSESSED",
                 "access_control": "ROLE_BASED",
                 "breach_response": "AUTOMATED"
             },
             "findings": {
                 "unauthorized_access_attempts_blocked": blocks,
                 "personal_data_protection_events": denials,
-                "breach_response_time_minutes": 5
+                "breach_response_time_minutes": None
             }
         },
         "SOC2": {
@@ -3971,9 +4240,9 @@ def get_compliance_report(
             },
             "findings": {
                 "unauthorized_access_attempts_blocked": blocks,
-                "system_uptime_percent": 99.95,
+                "system_uptime_percent": None,
                 "security_incidents_detected": blocks + denials,
-                "mean_detection_time_seconds": 0.05
+                "mean_detection_time_seconds": None
             }
         }
     }
@@ -3983,7 +4252,8 @@ def get_compliance_report(
     report["attestation_id"] = attestation_id
     report["attestation_date"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
     report["total_audit_events"] = audit_count
-    report["status"] = "COMPLIANT"
+    report["status"] = "NOT_ASSESSED"
+    report["assessment_note"] = "Observed security metrics; independent compliance assessment is required."
     report["auditor"] = "CyberAccess Automated Compliance Engine"
     report["next_review_date"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + 86400*90))
 
@@ -3994,7 +4264,7 @@ def get_compliance_report(
             "(id, tenant_id, compliance_type, status, attestation_date, attestation_body, auditor_name) "
             "VALUES (%s, %s, %s, %s, %s, %s, %s) "
             "ON CONFLICT (tenant_id, compliance_type, attestation_date) DO NOTHING",
-            (attestation_id, tenant_id, compliance_type, "COMPLIANT", now, json.dumps(report), "CyberAccess")
+            (attestation_id, tenant_id, compliance_type, "NOT_ASSESSED", now, json.dumps(report), "CyberAccess")
         )
 
     return report
@@ -4004,14 +4274,14 @@ def get_compliance_report(
 def _require_own_tenant_or_admin(tenant_id: str, identity: tuple[str, str, str]) -> None:
     _subject, role, caller_tenant_id = identity
     if tenant_id != caller_tenant_id:
-        require_security_admin(role)
+        raise HTTPException(403, "Tenant access denied")
 
 
 @app.get("/tenants/{tenant_id}/analytics/overview")
 def get_analytics_overview(
     tenant_id: str,
     window_hours: float = 24.0,
-    identity: tuple[str, str, str] = Depends(get_current_identity)
+    identity: tuple[str, str, str] = Depends(get_tenant_admin_identity)
 ) -> dict:
     """Aggregated security posture for a dashboard: request volume, decision
     breakdown, and risk-score distribution over a rolling time window."""
@@ -4055,7 +4325,7 @@ def get_analytics_overview(
 def get_threat_summary(
     tenant_id: str,
     window_hours: float = 24.0,
-    identity: tuple[str, str, str] = Depends(get_current_identity)
+    identity: tuple[str, str, str] = Depends(get_tenant_admin_identity)
 ) -> dict:
     """Phase 4 threat-detection signals over a rolling window: IP event breakdown
     and IPs whose violation count crossed the reputation threshold."""
@@ -4090,7 +4360,7 @@ def get_threat_summary(
 def get_roi_estimate(
     tenant_id: str,
     window_days: float = 30.0,
-    identity: tuple[str, str, str] = Depends(get_current_identity)
+    identity: tuple[str, str, str] = Depends(get_tenant_admin_identity)
 ) -> dict:
     """Estimated value delivered over a rolling window, computed from observed attacks-blocked
     counts and operator-configurable assumptions (ROI_ASSUMED_* env vars). This is an estimation
@@ -4317,12 +4587,13 @@ def ensure_database() -> None:
     init_schema()
     apply_migrations(db)  # Apply enterprise feature migrations
     seed_demo_tenant(force=False)
-    with db() as c:
-        c.execute(
-            "INSERT INTO tenants (id, name, api_key_hash, created_at) VALUES (%s, %s, %s, %s) "
-            "ON CONFLICT (id) DO NOTHING",
-            ("lost_found_dev", "Lost & Found Dev", hash_api_key("dev_test_key"), time.time()),
-        )
+    if APP_ENV in ("dev", "test") and DEMO_MODE:
+        with db() as c:
+            c.execute(
+                "INSERT INTO tenants (id, name, api_key_hash, created_at) VALUES (%s, %s, %s, %s) "
+                "ON CONFLICT (id) DO NOTHING",
+                ("lost_found_dev", "Lost & Found Dev", hash_api_key("dev_test_key"), time.time()),
+            )
 
 
 ensure_database()

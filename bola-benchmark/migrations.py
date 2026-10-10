@@ -4,8 +4,9 @@ Immutable audit logs, multi-tenant quotas, compliance tracking, alerting.
 """
 import time
 import hashlib
+from database import has_column, DATABASE_BACKEND
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 20
 MIGRATIONS = [
     # Existing migrations (1-9 from app.py init_schema)
     # ... (these run in init_schema)
@@ -159,7 +160,49 @@ MIGRATIONS = [
         -- since that flow has no other way to follow up with a new tenant.
         ALTER TABLE tenants ADD COLUMN email TEXT;
     """),
+    (19, ""),  # Convert epoch-based fields to match the application's numeric writes.
+    (20, """
+        CREATE TABLE IF NOT EXISTS dashboard_accounts (
+            email TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL UNIQUE REFERENCES tenants(id),
+            subject_id TEXT NOT NULL,
+            created_at DOUBLE PRECISION NOT NULL,
+            FOREIGN KEY (tenant_id, subject_id) REFERENCES users(tenant_id, id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS dashboard_sessions (
+            session_hash TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            subject_id TEXT NOT NULL,
+            expires_at DOUBLE PRECISION NOT NULL,
+            FOREIGN KEY (tenant_id, subject_id) REFERENCES users(tenant_id, id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_dashboard_session_expiry ON dashboard_sessions(expires_at);
+    """),
 ]
+
+
+def _normalize_numeric_columns(c):
+    columns = (
+        ("tenant_quotas", "updated_at"),
+        ("compliance_attestations", "attestation_date"),
+        ("rate_limit_state", "requests_reset_at"),
+        ("rate_limit_state", "last_updated"),
+        ("behavioral_profiles", "updated_at"),
+    )
+    for table, column in columns:
+        if DATABASE_BACKEND == "PostgreSQL":
+            row = c.execute(
+                "SELECT data_type FROM information_schema.columns WHERE table_schema = current_schema() "
+                "AND table_name = %s AND column_name = %s", (table, column)
+            ).fetchone()
+            if row and row["data_type"].startswith("timestamp"):
+                c.execute(f"ALTER TABLE {table} ALTER COLUMN {column} DROP DEFAULT")
+                c.execute(f"ALTER TABLE {table} ALTER COLUMN {column} TYPE DOUBLE PRECISION USING EXTRACT(EPOCH FROM {column})")
+                c.execute(f"ALTER TABLE {table} ALTER COLUMN {column} SET DEFAULT 0")
+        else:
+            c.execute(f"UPDATE {table} SET {column} = (julianday({column}) - 2440587.5) * 86400 WHERE typeof({column}) = 'text'")
+    if DATABASE_BACKEND == "PostgreSQL":
+        c.execute("ALTER TABLE behavioral_profiles ALTER COLUMN avg_requests_per_min TYPE DOUBLE PRECISION")
 
 
 def apply_migrations(db_connection):
@@ -182,7 +225,16 @@ def apply_migrations(db_connection):
             print(f"[migration] Applying v{version}...")
             try:
                 with db_connection() as c:
-                    c.execute(sql)
+                    if version == 17:
+                        if not has_column(c, "behavioral_profiles", "sample_count"):
+                            c.execute(sql)
+                    elif version == 18:
+                        if not has_column(c, "tenants", "email"):
+                            c.execute(sql)
+                    elif version == 19:
+                        _normalize_numeric_columns(c)
+                    else:
+                        c.execute(sql)
                     c.execute(
                         "INSERT INTO system_config (key, value, updated_at) "
                         "VALUES (%s, %s, %s) "
@@ -191,9 +243,9 @@ def apply_migrations(db_connection):
                     )
                 print(f"[migration] ✅ v{version} applied")
             except Exception as e:
-                print(f"[migration] ⚠️  v{version} skipped: {e.__class__.__name__}")
+                raise RuntimeError(f"Database migration v{version} failed") from e
     except Exception as e:
-        print(f"[migration] ❌ Error: {e}")
+        raise
 
 
 def compute_audit_hash(row: dict) -> str:

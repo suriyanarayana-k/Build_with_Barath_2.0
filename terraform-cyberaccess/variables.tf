@@ -11,9 +11,17 @@ variable "signup_key" {
 }
 
 variable "admin_jwt" {
-  description = "A security_admin-role JWT bearer token, used to manage quota and alert channels. Generate this out-of-band (e.g. via the backend's login endpoint) - Terraform does not create admin users."
+  description = "Optional admin JWT scoped to the managed tenant. Newly created tenants automatically use their generated API key instead."
   type        = string
   sensitive   = true
+  default     = ""
+}
+
+variable "tenant_api_key" {
+  description = "API key for existing_tenant_id, used to manage that tenant's quota and alert channels."
+  type        = string
+  sensitive   = true
+  default     = ""
 }
 
 variable "tenant_name" {
