@@ -1,5 +1,7 @@
 # CyberAccess
 
+Current release: [v1.2.0](https://github.com/BUILD-WITH-BARATH/Build_with_Barath_2.0/releases/tag/v1.2.0). See the [changelog](CHANGELOG.md) for release details.
+
 CyberAccess adds behavioral BOLA/IDOR detection to object authorization. A customer backend checks whether its user may access an object, sends that decision to `/v1/authorize`, and enforces the returned `allow`, `deny`, or `block` decision before returning data.
 
 The demo API also implements ownership, assignments, delegation, mutation permissions, hierarchy validation, batch access, jobs, GraphQL, stored references, ABAC, and canary records. The React dashboard shows audit events, risk, threat signals, and analytics. Lost & Found is a separate Django test application.

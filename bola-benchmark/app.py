@@ -72,6 +72,8 @@ import threat_detection
 # Phase 6: third-party SIEM integrations (Datadog, Splunk)
 import integrations
 
+APP_VERSION = "1.2.0"
+
 # --- Configuration (env-overridable; defaults are dev-only, never use these in production) ---
 APP_ENV = os.environ.get("APP_ENV", "dev")
 DEMO_MODE = os.environ.get("DEMO_MODE", "true").lower() != "false"
@@ -1179,7 +1181,7 @@ class BehavioralRiskEngine:
 
 
 engine = BehavioralRiskEngine()
-app = FastAPI(title="BOLA Graph Benchmark", version="1.1.1")
+app = FastAPI(title="BOLA Graph Benchmark", version=APP_VERSION)
 
 # ===== PROMETHEUS METRICS (Enterprise Observability) =====
 authorize_counter = Counter('authorize_decisions_total', 'Product API authorization decisions', ['decision', 'tenant_id'])
@@ -1517,7 +1519,7 @@ app.add_middleware(DashboardSessionMiddleware)
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "env": APP_ENV, "demo_mode": DEMO_MODE, "version": "1.1.1"}
+    return {"status": "ok", "env": APP_ENV, "demo_mode": DEMO_MODE, "version": APP_VERSION}
 
 
 def _rate_limit_key(request: Request) -> str:
